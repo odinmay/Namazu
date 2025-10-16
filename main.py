@@ -21,7 +21,7 @@ logger.addHandler(handler)
 
 
 # Instantiate the bot object and set options variables
-intents = discord.Intents(messages=True, message_content=True)
+intents = discord.Intents(messages=True, message_content=True, guilds=True)
 client = commands.Bot(command_prefix=".", intents=intents)
 
 # Test url for now
@@ -84,6 +84,7 @@ async def get_data():
 @client.event
 async def on_ready():
     await client.tree.sync()
+    await client.load_extension('cogs.live_tracking')
     await client.change_presence(activity=discord.Game(name='github.com/odinmay'))
 
 
