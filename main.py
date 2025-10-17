@@ -10,6 +10,7 @@ from discord.ext import commands
 from discord import app_commands
 from discord.utils import get
 
+version_number = "v0.03"
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 
 # Setup logging and file handler
@@ -25,7 +26,7 @@ intents = discord.Intents(messages=True, message_content=True, guilds=True)
 client = commands.Bot(command_prefix=".", intents=intents)
 
 # Test url for now
-EARTHQUAKE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson"
+EARTHQUAKE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_hour.geojson"
 
 
 def split_message(message):
@@ -116,4 +117,5 @@ async def eq(ctx):
 
 
 if __name__ == '__main__':
+    print("Version #: " + version_number)
     client.run(DISCORD_SECRET, log_level=logging.DEBUG)

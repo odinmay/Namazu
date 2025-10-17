@@ -17,7 +17,7 @@ logging.getLogger('discord.http').setLevel(logging.INFO)
 logger.addHandler(handler)
 
 # LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_hour.geojson"
-LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_week.geojson"
+LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_hour.geojson"
 
 
 async def setup_database():
@@ -47,16 +47,17 @@ def create_embed_quake_alert(earthquake_data: dict):
         case "red":
             embed_color = discord.Color.red()
         case _:
-            embed_color = discord.Color.black()
+            embed_color = discord.Color.dark_gray()
 
     embed = discord.Embed(
         title="🚨 Earthquake Alert 🚨",
-        description="Test description",
+        description=earthquake_data["description"],
         color=embed_color
     )
-    embed.add_field(name="Location", value=earthquake_data["place"])
-    embed.add_field(name="Magnitude", value=earthquake_data["magnitude"])
-    embed.add_field(name="Time", value=earthquake_data["time"])
+    if earthquake_data["tsunami_potential"]:
+        embed.add_field(name="Potential for a Tsunami", value="🌊", inline=False)
+
+    embed.add_field(name="Time", value=earthquake_data["time"], inline=False)
     return embed
 
 class LiveTracking(commands.Cog):
@@ -94,7 +95,11 @@ class LiveTracking(commands.Cog):
         time_ms = feature_obj.get("properties")["time"]
         time_seconds = time_ms / 1000
         dt = datetime.fromtimestamp(time_seconds)
-        formatted_dt = dt.strftime("%m/%d/%Y %I:%M:%S")
+        formatted_dt = dt.strftime("%m/%d/%Y %I:%M:%S %p")
+        tsunami_potential = feature_obj.get("properties")["tsunami"]
+        depth = feature_obj.get("properties")["depth"]
+
+        description = f"An earthquake has just occurred {place} with a magnitude of {mag} at a depth of {depth}km."
 
         earthquake_id = str(feature_obj.get("properties").get("code")) + "-" + str(feature_obj.get("properties").get("time"))
 
@@ -106,6 +111,9 @@ class LiveTracking(commands.Cog):
             "time": formatted_dt,
             "earthquake_id": earthquake_id,
             "pager_alert_level": pager_alert_level,
+            "description": description,
+            "tsunami_potential": tsunami_potential,
+            "depth": depth,
         }
 
     @tasks.loop(seconds=60.0)
