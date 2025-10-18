@@ -5,6 +5,7 @@ import logging
 
 from discord.ext import tasks, commands
 from discord.utils import get
+import plotly.graph_objects as go
 import discord
 import aiohttp
 
@@ -37,25 +38,42 @@ async def setup_database():
 
 def create_embed_quake_alert(earthquake_data: dict):
     # Check on the color and make embed the color, else make it gray
+
     match earthquake_data["pager_alert_level"]:
         case "green":
             embed_color = discord.Color.green()
+            pager_alert = "No expected casualties or damage"
+            valid_pager_alert = True
         case "yellow":
             embed_color = discord.Color.yellow()
+            pager_alert = "Some casualties and localized damage possible"
+            valid_pager_alert = True
         case "orange":
             embed_color = discord.Color.orange()
+            pager_alert = "Significant casualties and regional damage likely"
+            valid_pager_alert = True
         case "red":
             embed_color = discord.Color.red()
+            pager_alert = "high casualties and widespread catastrophic damage expected"
+            valid_pager_alert = True
         case _:
             embed_color = discord.Color.dark_gray()
+            valid_pager_alert = False
 
     embed = discord.Embed(
-        title="🚨 Earthquake Alert 🚨",
-        description=earthquake_data["description"],
+        title=f"🚨 {earthquake_data["magnitude"]} Earthquake 🚨",
+        description=f"A magnitude {earthquake_data["magnitude"]} earthquake has just occurred {earthquake_data["place"]}.",
         color=embed_color
     )
+
+    if earthquake_data.get("magnitude"):
+        embed.add_field(name="Magnitude", value=earthquake_data.get("magnitude"), inline=False)
+
     if earthquake_data["tsunami_potential"]:
-        embed.add_field(name="Potential for a Tsunami", value="🌊", inline=False)
+        embed.add_field(name="There is potential for a Tsunami", value="🌊", inline=False)
+
+    if valid_pager_alert:
+        embed.add_field(name="PAGER Alert", value=pager_alert, inline=False)
 
     embed.add_field(name="Time", value=earthquake_data["time"], inline=False)
     return embed
@@ -97,9 +115,14 @@ class LiveTracking(commands.Cog):
         dt = datetime.fromtimestamp(time_seconds)
         formatted_dt = dt.strftime("%m/%d/%Y %I:%M:%S %p")
         tsunami_potential = feature_obj.get("properties")["tsunami"]
-        depth = feature_obj.get("properties")["depth"]
+        depth = feature_obj.get("properties").get("depth")
+        longitude = feature_obj.get("properties").get("longitude")
+        latitude = feature_obj.get("properties").get("latitude")
 
-        description = f"An earthquake has just occurred {place} with a magnitude of {mag} at a depth of {depth}km."
+        if not depth:
+            depth = "unknown"
+        else:
+            depth = str(depth)
 
         earthquake_id = str(feature_obj.get("properties").get("code")) + "-" + str(feature_obj.get("properties").get("time"))
 
@@ -111,9 +134,10 @@ class LiveTracking(commands.Cog):
             "time": formatted_dt,
             "earthquake_id": earthquake_id,
             "pager_alert_level": pager_alert_level,
-            "description": description,
             "tsunami_potential": tsunami_potential,
             "depth": depth,
+            "latitude": latitude,
+            "longitude": longitude,
         }
 
     @tasks.loop(seconds=60.0)
