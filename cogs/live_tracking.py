@@ -1,40 +1,53 @@
-from pprint import pprint
+import time
+
 import aiosqlite
 from datetime import datetime
 import logging
+import os
 
 from discord.ext import tasks, commands
 from discord.utils import get
+from colorlog.escape_codes import escape_codes as c
 import plotly.graph_objects as go
 import discord
 import aiohttp
 
 DB_PATH = "namazu.db"
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
-logger = logging.getLogger('discord')
-logger.setLevel(logging.DEBUG)
-logging.getLogger('discord.http').setLevel(logging.INFO)
-logger.addHandler(handler)
+logger = logging.getLogger("discord")
 
 # LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_hour.geojson"
 LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_hour.geojson"
 
+""" 
+DEVMODE Environment var is passed to the run config for "test" in pycharm
+It resets db and only post updates in dev-quake-updates channel.
+"""
+DEVMODE = os.getenv("DEVMODE")
+if DEVMODE:
+    logging.info("DEVMODE active. Removing database...")
+    os.remove("namazu.db")
+    logging.info("Database removed.")
+
+
+def colorize(text, color):
+    return f"{c[color]}{text}{c['reset']}"
+
 
 async def setup_database():
     """Initialize the database, create the required tables"""
-    logging.info("Running Database Setup")
+    logging.info("Running database setup...")
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS earthquakes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            earthquake_id TEXT NOT NULL,
-            longitude REAL,
-            latitude REAL,
-            place TEXT)
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            EarthquakeId TEXT NOT NULL,
+            Longitude REAL,
+            Latitude REAL,
+            Place TEXT)
             """)
-
-        logging.info("Database setup complete")
+        logging.info("Database setup complete!")
 
 def create_embed_quake_alert(earthquake_data: dict):
     # Check on the color and make embed the color, else make it gray
@@ -81,13 +94,19 @@ def create_embed_quake_alert(earthquake_data: dict):
 class LiveTracking(commands.Cog):
     def __init__(self, client):
         self.client = client
-        self.poll_quakes.start()
-        self.client.loop.create_task(setup_database())
-        # Channel that live updates are posted to
-        self.update_channel = get(self.client.get_all_channels(), name="bot-commands")
+        self.client.loop.create_task(self._initialize())
+        # Channel that live updates get posted to
+        # self.update_channel = get(self.client.get_all_channels(), name="bot-commands")
 
     def cog_unload(self):
         self.poll_quakes.cancel()
+
+
+    async def _initialize(self):
+        """This func is run when on LiveTracking __init__ is called.
+        Ensures DB is set up before starting the polling loop."""
+        await setup_database()
+        self.poll_quakes.start()
 
 
     async def get_earthquake_data(self, feature_obj: dict):
@@ -113,7 +132,7 @@ class LiveTracking(commands.Cog):
         time_ms = feature_obj.get("properties")["time"]
         time_seconds = time_ms / 1000
         dt = datetime.fromtimestamp(time_seconds)
-        formatted_dt = dt.strftime("%m/%d/%Y %I:%M:%S %p")
+        formatted_dt = dt.strftime("%m/%d/%Y - %I:%M %p")
         tsunami_potential = feature_obj.get("properties")["tsunami"]
         depth = feature_obj.get("properties").get("depth")
         longitude = feature_obj.get("properties").get("longitude")
@@ -124,7 +143,7 @@ class LiveTracking(commands.Cog):
         else:
             depth = str(depth)
 
-        earthquake_id = str(feature_obj.get("properties").get("code")) + "-" + str(feature_obj.get("properties").get("time"))
+        earthquake_id = str(mag) + "-" + str(feature_obj.get("properties").get("code")) + "-" + str(feature_obj.get("properties").get("time"))
 
         return {
             "pager_lvl_icon": pager_lvl_icon,
@@ -145,13 +164,17 @@ class LiveTracking(commands.Cog):
         """Every 10 minutes, poll the api for new earthquakes. When a new quake is detected,
         add the quake_id to a sqlite database. If the quake is not in the database, it will be added.
         If the quake is in the database, it will be ignored."""
+        start_time = time.perf_counter()
+        logging.info("%s function initiated.", colorize("poll_quakes", "blue"))
+
         await self.client.wait_until_ready()
         async with aiohttp.ClientSession() as session:
             async with session.get(LIVE_URL) as resp:
                 data = await resp.json()
+                logging.debug(f"Request: {LIVE_URL}")
+                logging.debug(f"Response StatusCode: {resp.status}")
                 if resp.status != 200:
                     logging.error("Error getting latest data. Response text: %s", resp.text())
-                    print("Error getting latest data. Response text: %s", resp.text())
                     return
 
                 feature_list = data.get("features", [])
@@ -160,13 +183,17 @@ class LiveTracking(commands.Cog):
 
                     if await self.is_earthquake_already_in_db(eq_data["earthquake_id"]):
                         eq_embed = create_embed_quake_alert(eq_data)
-                        # channel = self.client.get_channel(1428197710485524511)
+
                         for guild in self.client.guilds:
-                            channel = get(guild.text_channels, name="quake-updates")
+                            if os.getenv("DEVMODE"):
+                                channel = get(guild.text_channels, name="dev-quake-updates")
+                            else:
+                                channel = get(guild.text_channels, name="quake-updates")
                             if channel:
                                 await channel.send(embed=eq_embed)
+                end_time = time.perf_counter()
 
-                print("Poll quakes complete!")
+                logging.info("%s function completed. Elapsed %.2f seconds.", colorize("poll_quakes", "blue"), end_time - start_time)
 
 
     @staticmethod
@@ -174,32 +201,28 @@ class LiveTracking(commands.Cog):
         """Add the earthquake to the sqlite database"""
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT INTO earthquakes (earthquake_id) VALUES (?)", (earthquake_id,))
-            print("Added earthquake id: %s", earthquake_id)
-            logging.info("EarthquakeID: %s added to the sqlite database", earthquake_id)
+            await db.execute("INSERT INTO earthquakes (EarthquakeId) VALUES (?)", (earthquake_id,))
+            logging.info("EarthquakeID | %-38s | Added to database", colorize(earthquake_id, "purple"))
             await db.commit()
 
     async def is_earthquake_already_in_db(self, earthquake_id):
         """Check if the earthquake id is already in the sqlite database"""
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT 1 FROM earthquakes WHERE earthquake_id = ?", (earthquake_id,)) as cursor:
+            async with db.execute("SELECT 1 FROM earthquakes WHERE EarthquakeID = ?", (earthquake_id,)) as cursor:
                 result = await cursor.fetchone()
-                print("DB Check result: ", result)
 
                 if result:
-                    logging.info("The earthquake id is already in the sqlite database")
-                    print("Already in sqlite database")
+                    logging.info(f"EarthquakeID | %-38s | Found in database", colorize(earthquake_id, "purple"))
                     return False
                 else:
-                    logging.info("Earthquake Id: %s is not in database..", earthquake_id)
-                    print(f"Earthquake Id: {earthquake_id} is not in database..")
+                    logging.info("EarthquakeID | %-38s | Not found in database..", colorize(earthquake_id, "purple"))
                     await self.add_earthquake(earthquake_id)
                     return True
+
 
     async def clear_database(self):
         """Truncate tables in the database to reset it"""
         pass
-
 
 async def setup(bot):
     await bot.add_cog(LiveTracking(bot))
