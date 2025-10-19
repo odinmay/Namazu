@@ -4,7 +4,7 @@ from pprint import pprint
 import logging
 import sys
 import os
-
+# External imports
 import discord
 import aiohttp
 from discord.ext import commands

@@ -1,0 +1,42 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments / local Python packages
+venv/
+.env/
+.env.*
+.venv/
+pip-wheel-metadata/
+
+# Docker and build files
+Dockerfile*
+docker-compose.yml
+
+# Git files
+.git
+.gitignore
+
+# Logs and runtime files
+*.log
+*.sqlite
+*.db
+
+# Editor files
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node / frontend folders (if you have any)
+node_modules/
+dist/
+build/

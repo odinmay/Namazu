@@ -8,7 +8,7 @@ import os
 from discord.ext import tasks, commands
 from discord.utils import get
 from colorlog.escape_codes import escape_codes as c
-import plotly.graph_objects as go
+
 import discord
 import aiohttp
 
@@ -25,9 +25,10 @@ It resets db and only post updates in dev-quake-updates channel.
 """
 DEVMODE = os.getenv("DEVMODE")
 if DEVMODE:
-    logging.info("DEVMODE active. Removing database...")
-    os.remove("namazu.db")
-    logging.info("Database removed.")
+    if os.path.exists("namazu.db"):
+        logging.info("DEVMODE active. Removing database...")
+        os.remove("namazu.db")
+        logging.info("Database removed.")
 
 
 def colorize(text, color):
