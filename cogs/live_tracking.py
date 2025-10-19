@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import logging
 import time
 import os
@@ -13,52 +14,6 @@ import aiohttp
 
 
 logging.getLogger("plotly.io._kaleido").setLevel(logging.WARNING)
-
-def plot_and_save(long, lat, place, mag):
-    # Coordinates for New York City
-    lon, lat = long, lat
-    label = mag
-
-    # Create the figure
-    fig = go.Figure()
-
-    # Add the point
-    fig.add_trace(go.Scattergeo(
-        lon = [lon],
-        lat = [lat],
-        text = label,
-        mode = 'markers+text',
-        marker=dict(size=8, color='red'),
-        textposition="top right"
-    ))
-
-    # Configure the globe layout
-    fig.update_geos(
-        projection_type="orthographic",  # Globe-style
-        showcountries=True,
-        showcoastlines=True,
-        showland=True,
-        landcolor="lightgray",
-        oceancolor="lightblue",
-        showocean=True,
-    )
-
-    # Set layout
-    fig.update_layout(
-        title=place,
-        margin={"r":0,"t":30,"l":0,"b":0},
-        geo=dict(
-            projection_rotation=dict(lon=lon, lat=lat)  # Center globe on the point
-        )
-    )
-    # Save to PNG
-    fig.write_image("eq_plot.png", width=400, height=400)  # small image 400x400 px
-
-
-
-
-
-
 
 DB_PATH = "namazu.db"
 
@@ -79,7 +34,58 @@ if DEVMODE:
         logging.info("Database removed.")
 
 
+def plot_and_save(long, lat, place, mag):
+    # Coordinates for New York City
+    lon, lat = long, lat
+    label = mag
+
+    # Create the figure
+    fig = go.Figure()
+
+    # Add the point
+    fig.add_trace(go.Scattergeo(
+        lon = [lon],
+        lat = [lat],
+        text = label,
+        mode = 'markers',
+        marker=dict(size=6, color='red'),
+        textposition="bottom left",
+        textfont=dict(weight=700, size=16, color='black'),
+        hoverinfo='text',
+    ))
+
+    # Configure the globe layout
+    fig.update_geos(
+        projection_type="natural earth",  # Globe-style
+        projection_scale=0.90,
+        showcountries=True,
+        showcoastlines=True,
+        showland=True,
+        landcolor="lightgray",
+        oceancolor="lightblue",
+        showocean=True,
+        bgcolor="#232328"
+    )
+
+    # Set layout
+    fig.update_layout(
+        title="Magnitude: " + str(mag) + " " +  place,
+        font=dict(
+            color='white'
+        ),
+        margin={"r":0,"t":30,"l":0,"b":0},
+        geo=dict(
+            projection_rotation=dict(lon=lon, lat=lat) # Center globe on the point
+        ),
+        paper_bgcolor="#232328",
+        plot_bgcolor="#232328",
+    )
+    # Save to PNG
+    fig.write_image("eq_plot.png", width=400, height=250)
+
+
 def colorize(text, color):
+    """Colorize text in the terminal. colorlog helper func"""
     return f"{c[color]}{text}{c['reset']}"
 
 
@@ -188,7 +194,8 @@ class LiveTracking(commands.Cog):
         url = feature_obj.get("properties")["url"]
         time_ms = feature_obj.get("properties")["time"]
         time_seconds = time_ms / 1000
-        dt = datetime.fromtimestamp(time_seconds)
+        utc_dt = datetime.fromtimestamp(time_seconds,tz=timezone.utc)
+        dt = utc_dt.astimezone(ZoneInfo("America/New_York"))
         formatted_dt = dt.strftime("%m/%d/%Y - %I:%M %p")
         tsunami_potential = feature_obj.get("properties")["tsunami"]
         depth = feature_obj.get("properties").get("depth")
@@ -236,10 +243,13 @@ class LiveTracking(commands.Cog):
                     return
 
                 feature_list = data.get("features", [])
+                if len(feature_list) == 0:
+                    return
+
                 for feature in feature_list:
                     eq_data = await self.get_earthquake_data(feature)
 
-                    if await self.is_earthquake_already_in_db(eq_data["earthquake_id"]):
+                    if await self.earthquake_not_in_db(eq_data["earthquake_id"]):
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
 
                         for guild in self.client.guilds:
@@ -263,7 +273,7 @@ class LiveTracking(commands.Cog):
             logging.info("EarthquakeID | %-38s | Added to database", colorize(earthquake_id, "purple"))
             await db.commit()
 
-    async def is_earthquake_already_in_db(self, earthquake_id):
+    async def earthquake_not_in_db(self, earthquake_id):
         """Check if the earthquake id is already in the sqlite database"""
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT 1 FROM earthquakes WHERE EarthquakeID = ?", (earthquake_id,)) as cursor:
