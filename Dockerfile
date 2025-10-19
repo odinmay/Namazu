@@ -1,20 +1,31 @@
-FROM python:3.12-alpine
-LABEL authors="odin"
+FROM python:3.12-slim
 
-# Install runtime dependencies for common Python packages
-RUN apk add --no-cache libffi openssl
+# Install Chromium and minimal dependencies
+RUN apt-get update && apt-get install -y \
+    chromium \
+    chromium-driver \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libpangocairo-1.0-0 \
+    libgtk-3-0 \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Create working directory
+# Set working directory
 WORKDIR /usr/src/namazu
 
-# Copy only requirements first to leverage Docker cache
 COPY requirements.txt .
-
-# Install dependencies (use --no-cache-dir to reduce image size)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Now copy the rest of the application
 COPY . .
 
-# Run the bot
+# Tell Kaleido to use this Chromium
+ENV KALEIDO_CHROME_PATH=/usr/bin/chromium
+
 CMD ["python", "-u", "main.py"]

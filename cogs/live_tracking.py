@@ -1,16 +1,64 @@
-import time
-
-import aiosqlite
 from datetime import datetime
 import logging
+import time
 import os
 
-from discord.ext import tasks, commands
-from discord.utils import get
 from colorlog.escape_codes import escape_codes as c
-
+from discord.ext import tasks, commands
+import plotly.graph_objects as go
+from discord.utils import get
+import aiosqlite
 import discord
 import aiohttp
+
+
+logging.getLogger("plotly.io._kaleido").setLevel(logging.WARNING)
+
+def plot_and_save(long, lat, place, mag):
+    # Coordinates for New York City
+    lon, lat = long, lat
+    label = mag
+
+    # Create the figure
+    fig = go.Figure()
+
+    # Add the point
+    fig.add_trace(go.Scattergeo(
+        lon = [lon],
+        lat = [lat],
+        text = label,
+        mode = 'markers+text',
+        marker=dict(size=8, color='red'),
+        textposition="top right"
+    ))
+
+    # Configure the globe layout
+    fig.update_geos(
+        projection_type="orthographic",  # Globe-style
+        showcountries=True,
+        showcoastlines=True,
+        showland=True,
+        landcolor="lightgray",
+        oceancolor="lightblue",
+        showocean=True,
+    )
+
+    # Set layout
+    fig.update_layout(
+        title=place,
+        margin={"r":0,"t":30,"l":0,"b":0},
+        geo=dict(
+            projection_rotation=dict(lon=lon, lat=lat)  # Center globe on the point
+        )
+    )
+    # Save to PNG
+    fig.write_image("eq_plot.png", width=400, height=400)  # small image 400x400 px
+
+
+
+
+
+
 
 DB_PATH = "namazu.db"
 
@@ -53,6 +101,11 @@ async def setup_database():
 def create_embed_quake_alert(earthquake_data: dict):
     # Check on the color and make embed the color, else make it gray
 
+    plot_and_save(earthquake_data["longitude"],
+                  earthquake_data["latitude"],
+                  earthquake_data["place"],
+                  earthquake_data["magnitude"])
+
     match earthquake_data["pager_alert_level"]:
         case "green":
             embed_color = discord.Color.green()
@@ -89,8 +142,11 @@ def create_embed_quake_alert(earthquake_data: dict):
     if valid_pager_alert:
         embed.add_field(name="PAGER Alert", value=pager_alert, inline=False)
 
+    img_file = discord.File("eq_plot.png", filename="earthquake.png")
+    embed.set_image(url="attachment://earthquake.png")
+
     embed.add_field(name="Time", value=earthquake_data["time"], inline=False)
-    return embed
+    return embed, img_file
 
 class LiveTracking(commands.Cog):
     def __init__(self, client):
@@ -136,8 +192,9 @@ class LiveTracking(commands.Cog):
         formatted_dt = dt.strftime("%m/%d/%Y - %I:%M %p")
         tsunami_potential = feature_obj.get("properties")["tsunami"]
         depth = feature_obj.get("properties").get("depth")
-        longitude = feature_obj.get("properties").get("longitude")
-        latitude = feature_obj.get("properties").get("latitude")
+        longitude = feature_obj.get("geometry").get("coordinates")[0]
+        latitude = feature_obj.get("geometry").get("coordinates")[1]
+
 
         if not depth:
             depth = "unknown"
@@ -183,7 +240,7 @@ class LiveTracking(commands.Cog):
                     eq_data = await self.get_earthquake_data(feature)
 
                     if await self.is_earthquake_already_in_db(eq_data["earthquake_id"]):
-                        eq_embed = create_embed_quake_alert(eq_data)
+                        eq_embed, img_file = create_embed_quake_alert(eq_data)
 
                         for guild in self.client.guilds:
                             if os.getenv("DEVMODE"):
@@ -191,7 +248,7 @@ class LiveTracking(commands.Cog):
                             else:
                                 channel = get(guild.text_channels, name="quake-updates")
                             if channel:
-                                await channel.send(embed=eq_embed)
+                                await channel.send(embed=eq_embed, file=img_file)
                 end_time = time.perf_counter()
 
                 logging.info("%s function completed. Elapsed %.2f seconds.", colorize("poll_quakes", "blue"), end_time - start_time)
