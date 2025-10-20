@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Install Chromium and minimal dependencies
+# Install Chromium, minimal dependencies, and Tini
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     libpangocairo-1.0-0 \
     libgtk-3-0 \
     ca-certificates \
+    tini \
  && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -28,4 +29,8 @@ COPY . .
 # Tell Kaleido to use this Chromium
 ENV KALEIDO_CHROME_PATH=/usr/bin/chromium
 
+# Use Tini as the entrypoint to manage and reap child processes (like Chromium)
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Run your main application as the command under Tini
 CMD ["python", "-u", "main.py"]

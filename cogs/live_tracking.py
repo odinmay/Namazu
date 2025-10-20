@@ -1,4 +1,6 @@
+import asyncio
 from datetime import datetime, timezone
+from unittest import case
 from zoneinfo import ZoneInfo
 import logging
 import time
@@ -12,15 +14,12 @@ import aiosqlite
 import discord
 import aiohttp
 
-
-logging.getLogger("plotly.io._kaleido").setLevel(logging.WARNING)
-
 DB_PATH = "namazu.db"
 
 logger = logging.getLogger("discord")
 
 # LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_hour.geojson"
-LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/1.0_hour.geojson"
+LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
 
 """ 
 DEVMODE Environment var is passed to the run config for "test" in pycharm
@@ -34,7 +33,13 @@ if DEVMODE:
         logging.info("Database removed.")
 
 
-def plot_and_save(long, lat, place, mag):
+def plot_with_guild_preference(guid_id: int):
+    """load guilds plot style preference and use that one to plot the map image"""
+
+    pass
+
+
+def plot_to_img_with_plotly(long, lat, place, mag):
     # Coordinates for New York City
     lon, lat = long, lat
     label = mag
@@ -96,21 +101,33 @@ async def setup_database():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS earthquakes (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            EarthquakeId TEXT NOT NULL,
-            Longitude REAL,
-            Latitude REAL,
-            Place TEXT)
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                EarthquakeId TEXT NOT NULL,
+                Longitude REAL,
+                Latitude REAL,
+                Place TEXT)
             """)
-        logging.info("Database setup complete!")
+        logging.info("%s table created.", colorize("earthquake", "yellow"))
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS guild_prefs (
+            GuildId INTEGER PRIMARY KEY,
+            UpdateFrequency INTEGER,
+            MinMagnitude INTEGER,
+            UpdateChannelId INTEGER,
+            PlotStyle INTEGER)
+        """)
+        logging.info("%s table created.", colorize("guild_prefs", "yellow"))
+        logging.info("%s sqlite3 database setup complete!", colorize("namazu.db", "yellow"))
+
 
 def create_embed_quake_alert(earthquake_data: dict):
     # Check on the color and make embed the color, else make it gray
 
-    plot_and_save(earthquake_data["longitude"],
-                  earthquake_data["latitude"],
-                  earthquake_data["place"],
-                  earthquake_data["magnitude"])
+    plot_to_img_with_plotly(earthquake_data["longitude"],
+                            earthquake_data["latitude"],
+                            earthquake_data["place"],
+                            earthquake_data["magnitude"])
 
     match earthquake_data["pager_alert_level"]:
         case "green":
@@ -158,6 +175,7 @@ class LiveTracking(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.client.loop.create_task(self._initialize())
+        self.guild_prefs = {}
         # Channel that live updates get posted to
         # self.update_channel = get(self.client.get_all_channels(), name="bot-commands")
 
@@ -169,6 +187,10 @@ class LiveTracking(commands.Cog):
         """This func is run when on LiveTracking __init__ is called.
         Ensures DB is set up before starting the polling loop."""
         await setup_database()
+        # Build a local dictionary of all guild preferences
+        for guild in self.client.guilds:
+            self.guild_prefs[guild.id] = await self.get_or_set_guilds_default_config(guild.id)
+
         self.poll_quakes.start()
 
 
@@ -246,19 +268,46 @@ class LiveTracking(commands.Cog):
                 if len(feature_list) == 0:
                     return
 
+                # loop over the geojson features (earthquakes)
                 for feature in feature_list:
                     eq_data = await self.get_earthquake_data(feature)
 
+                    # If it is not in the database, add it to db and then create embed
                     if await self.earthquake_not_in_db(eq_data["earthquake_id"]):
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
 
+                        # Message handling for each Guild the bot is in
                         for guild in self.client.guilds:
                             if os.getenv("DEVMODE"):
                                 channel = get(guild.text_channels, name="dev-quake-updates")
                             else:
                                 channel = get(guild.text_channels, name="quake-updates")
+
                             if channel:
-                                await channel.send(embed=eq_embed, file=img_file)
+                                match self.guild_prefs[guild.id]["MinMagnitude"]:
+                                    case 0:
+                                        await channel.send(embed=eq_embed, file=img_file)
+                                    case 1:
+                                        if eq_data["magnitude"] >= 1.0:
+                                            await channel.send(embed=eq_embed, file=img_file)
+                                        else:
+                                            logging.info(f"Magnitude {eq_data['magnitude']} is too low (<1.0), skipping message for guild: {guild}")
+                                    case 2:
+                                        if eq_data["magnitude"] >= 2.5:
+                                            await channel.send(embed=eq_embed, file=img_file)
+                                        else:
+                                            logging.info(
+                                                f"Magnitude {eq_data['magnitude']} is too low (<2.5), skipping message for guild: {guild}")
+                                    case 3:
+                                        if eq_data["magnitude"] >= 4.5:
+                                            await channel.send(embed=eq_embed, file=img_file)
+                                        else:
+                                            logging.info(
+                                                f"Magnitude {eq_data['magnitude']} is too low (<4.5), skipping message for guild: {guild}")
+                                    case 4:
+                                        logging.info("Significant only quakes selected, but not configured(how to parse these from the hourly all eq feed?)")
+                                        pass
+
                 end_time = time.perf_counter()
 
                 logging.info("%s function completed. Elapsed %.2f seconds.", colorize("poll_quakes", "blue"), end_time - start_time)
@@ -287,6 +336,129 @@ class LiveTracking(commands.Cog):
                     await self.add_earthquake(earthquake_id)
                     return True
 
+    @commands.command()
+    async def config(self, ctx: commands.Context):
+        """Configure the bot"""
+        user = ctx.author
+
+        msg = await ctx.send(
+            "Please choose a minimum magnitude to report on.\n\n"
+            "0️⃣ | All earthquakes (Caution.. lots)\n"
+            "1️⃣ | 1.0 and above\n"
+            "2️⃣ | 2.5 and above\n"
+            "3️⃣ | 4.5 and above\n"
+            "4️⃣ | Significant only"
+        )
+        reactions = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+
+        for reaction in reactions:
+            await msg.add_reaction(reaction)
+
+
+        try:
+            reaction, usr = await self.client.wait_for(
+                "reaction_add",
+                timeout=60.0
+            )
+
+            logging.info(f"Reaction : {reaction}, user: {usr.name}")
+            emoji = str(reaction.emoji)
+
+        except asyncio.TimeoutError:
+            await ctx.send("Timed out. You must re-run the .config command, and react within 1 minute.")
+            return
+
+        match emoji:
+            case "0️⃣":
+                logging.info("Case: 0 Guild prefs = ", self.guild_prefs)
+                await self.set_guild_preference(guild_id=ctx.guild.id, preference="MinMagnitude", choice=0)
+                await ctx.send("All earthquakes are being reported on by the minute.")
+            case "1️⃣":
+                logging.info("Case: 1 Guild prefs = ", self.guild_prefs)
+                await self.set_guild_preference(guild_id=ctx.guild.id, preference="MinMagnitude", choice=1)
+                await ctx.send("1.0+ earthquakes are being reported on by the minute.")
+            case "2️⃣":
+                logging.info("Case: 2 Guild prefs = ", self.guild_prefs)
+                await self.set_guild_preference(guild_id=ctx.guild.id, preference="MinMagnitude", choice=2)
+                await ctx.send("2.5+ earthquakes are being reported on by the minute.")
+            case "3️⃣":
+                logging.info("Case: 3 Guild prefs = ", self.guild_prefs)
+                await self.set_guild_preference(guild_id=ctx.guild.id, preference="MinMagnitude", choice=3)
+                await ctx.send("4.5+ earthquakes are being reported on by the minute.")
+            case "4️⃣":
+                logging.info("Case: 4 Guild prefs = ", self.guild_prefs)
+                await self.set_guild_preference(guild_id=ctx.guild.id, preference="MinMagnitude", choice=4)
+                await ctx.send("Only significant earthquakes are being reported on by the minute.")
+            case _:
+                await ctx.send("That is not a valid emoji.")
+
+        await msg.delete()
+
+    async def set_guild_preference(self, guild_id: int, preference: str, choice: int):
+        """Set the preference for a guild in the database"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            logging.info(f"Setting {preference} for guild {guild_id} to {choice}")
+            async with db.execute(f"UPDATE guild_prefs set {preference} = {choice} WHERE GuildId = {guild_id}") as cursor:
+                result = await cursor.fetchone()
+                await db.commit()
+                logging.info(f"Database update successful!.")
+
+                self.guild_prefs[str(guild_id)] = await self.get_or_set_guilds_default_config(guild_id)
+
+
+    async def get_or_set_guilds_default_config(self, guild_id: int):
+        """Get guild config from database, or create defaults and return them if not present"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("""
+                                  SELECT GuildId, UpdateFrequency, MinMagnitude, UpdateChannelId, PlotStyle
+                                  FROM guild_prefs
+                                  WHERE GuildId = ?
+                                  """, (guild_id,)) as cursor:
+                result = await cursor.fetchone()
+
+            if not result:
+                logging.info(f"Guild {guild_id} not in preferences database, adding defaults")
+                await db.execute("""
+                                 INSERT INTO guild_prefs (GuildId, UpdateFrequency, MinMagnitude, UpdateChannelId, PlotStyle)
+                                 VALUES (?, ?, ?, ?, ?)
+                                 """, (guild_id, 60, 2, 0, 0))
+                await db.commit()
+
+                # Fetch the newly inserted row to return it
+                async with db.execute("""
+                                      SELECT GuildId, UpdateFrequency, MinMagnitude, UpdateChannelId, PlotStyle
+                                      FROM guild_prefs
+                                      WHERE GuildId = ?
+                                      """, (guild_id,)) as cursor:
+                    result = await cursor.fetchone()
+
+                    # Save results to a dict for easy accessing
+                    guild_pref_dict = {
+                        "UpdateFrequency": result[1],
+                        "MinMagnitude": result[2],
+                        "UpdateChannelId": result[3],
+                        "PlotStyle": result[4]
+                    }
+            else:
+                # Save results to a dict for easy accessing
+                guild_pref_dict = {
+                    "UpdateFrequency": result[1],
+                    "MinMagnitude": result[2],
+                    "UpdateChannelId": result[3],
+                    "PlotStyle": result[4]
+                }
+            return guild_pref_dict
+
+
+    async def get_guild_preference_choice(self, guild_id: int, preference: str) -> int:
+        """Get the preference for a guild in the database"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(f"""
+            SELECT {preference} FROM guild_prefs WHERE GuildId = {guild_id}
+            """) as cursor:
+                result = await cursor.fetchone()
+                result = result[0]
+                return result
 
     async def clear_database(self):
         """Truncate tables in the database to reset it"""
