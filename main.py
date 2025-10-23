@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 import colorlog
 
-version_number = "v0.06"
+version_number = "v0.10"
 
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 

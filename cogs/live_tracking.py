@@ -92,7 +92,7 @@ def plot_to_img_with_plotly(long, lat, place, mag):
 
 
 def colorize(text, color):
-    """Colorize text in the terminal. colorlog helper func"""
+    """Colorize text in the terminal with colorlog helper func"""
     return f"{c[color]}{text}{c['reset']}"
 
 
@@ -133,7 +133,10 @@ def create_embed_quake_alert(earthquake_data: dict):
     if earthquake_data.get("magnitude"):
         embed.add_field(name="Magnitude", value=earthquake_data.get("magnitude"), inline=False)
 
-    if earthquake_data["tsunami_potential"]:
+    if earthquake_data.get("significance"):
+        embed.add_field(name="Significance[1-1000]", value=earthquake_data["significance"], inline=True)
+
+    if earthquake_data.get("tsunami_potential"):
         embed.add_field(name="There is potential for a Tsunami", value="🌊", inline=False)
 
     if valid_pager_alert:
@@ -180,8 +183,6 @@ class LiveTracking(commands.Cog):
 
             logging.info("Guild prefs at the end of  _initialize method. Guild prefs: ", self.guild_prefs)
 
-
-
         self.poll_quakes.start()
 
 
@@ -203,11 +204,13 @@ class LiveTracking(commands.Cog):
                     # Create and send the message
                     eq_embed, img_file = create_embed_quake_alert(eq_data)
                     await channel.send(embed=eq_embed, file=img_file)
+                    self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
                 case 1:
                     if eq_data["magnitude"] >= 1.0:
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
+                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<1.0), skipping message for guild: {guild}")
@@ -216,6 +219,7 @@ class LiveTracking(commands.Cog):
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
+                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<2.5), skipping message for guild: {guild}")
@@ -224,18 +228,19 @@ class LiveTracking(commands.Cog):
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
+                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<4.5), skipping message for guild: {guild}")
                 case 4:
-                    # # See if we should send message and send it if the criteria is met for the guild
+                    # # See if we should send the message and send it if the criteria is met for the guild
                     # eq_embed, img_file = create_embed_quake_alert(eq_data)
                     logging.info(
                         "Significant only quakes selected, but not configured(how to parse these from the hourly all eq feed?)")
 
 
     async def get_earthquake_data(self, feature_obj: dict):
-        """Unpack the dictionary and format all values, return formatted dict"""
+        """Unpack the dictionary and format all values, return a formatted dict"""
         pager_alert_level = feature_obj.get("properties")["alert"]
 
         # Give each alert level an emoji | Info - https://earthquake.usgs.gov/data/pager/onepager.php
@@ -263,6 +268,7 @@ class LiveTracking(commands.Cog):
         depth = feature_obj.get("properties").get("depth")
         longitude = feature_obj.get("geometry").get("coordinates")[0]
         latitude = feature_obj.get("geometry").get("coordinates")[1]
+        significance = feature_obj.get("properties").get("sig")
 
         if not depth:
             depth = "unknown"
@@ -294,13 +300,14 @@ class LiveTracking(commands.Cog):
             "depth": depth,
             "latitude": latitude,
             "longitude": longitude,
+            "significance": significance,
         }
 
 
     @tasks.loop(seconds=60.0)
     async def poll_quakes(self):
         """Every 10 minutes, poll the api for new earthquakes. When a new quake is detected, add the quake_id
-        to the eq_db dictionary. If the guildid.quakeid = false, the eq has not been reported on by that guild
+        to the eq_db dictionary. If the guildid.quakeid = false, that guild has not reported on the eq
         If the quake is in the dict, it will be ignored."""
         print("Guild prefs from start of poll quakes cmd: ", self.guild_prefs)
         start_time = time.perf_counter()

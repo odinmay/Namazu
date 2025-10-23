@@ -1,24 +1,13 @@
 FROM python:3.12-slim
 
-# Install Chromium, minimal dependencies, and Tini
-RUN apt-get update && apt-get install -y \
+# Install Chromium (for Kaleido v1+) and Tini
+# Chromium package automatically installs all required dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
-    chromium-driver \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libpangocairo-1.0-0 \
-    libgtk-3-0 \
-    ca-certificates \
     tini \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Set working directory
 WORKDIR /usr/src/namazu
 
 COPY requirements.txt .
@@ -26,11 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Tell Kaleido to use this Chromium
 ENV KALEIDO_CHROME_PATH=/usr/bin/chromium
 
-# Use Tini as the entrypoint to manage and reap child processes (like Chromium)
 ENTRYPOINT ["/usr/bin/tini", "--"]
-
-# Run your main application as the command under Tini
 CMD ["python", "-u", "main.py"]
