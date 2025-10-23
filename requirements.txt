@@ -1,7 +1,6 @@
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.0
 aiosignal==1.4.0
-aiosqlite==0.21.0
 attrs==25.4.0
 certifi==2025.10.5
 choreographer==1.1.2
