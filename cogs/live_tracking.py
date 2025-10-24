@@ -10,6 +10,7 @@ from colorlog.escape_codes import escape_codes as c
 from discord.ext import tasks, commands
 import plotly.graph_objects as go
 from discord.utils import get
+import pandas as pd
 import discord
 import aiohttp
 
@@ -18,7 +19,18 @@ logger = logging.getLogger("discord")
 LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
 
 GUILD_PREFS_PATH = "/data/guild_prefs.pkl"
-EQ_DB_PATH = "/data/eq_db.pkl"
+EQ_NOTIFY_DB_PATH = "/data/eq_notify_db.pkl"
+EQ_DB_PATH = "/data/eq_db1.pkl"
+
+
+def get_eq_db():
+    if os.path.exists(EQ_DB_PATH):
+        with open(EQ_DB_PATH, "rb") as f:
+            eq_db = pickle.load(f)
+            return eq_db
+    else:
+        eq_db = {}
+        return eq_db
 
 
 def get_guild_prefs():
@@ -31,15 +43,55 @@ def get_guild_prefs():
     return guild_prefs
 
 
-def get_eq_db():
-    if os.path.exists(EQ_DB_PATH):
-        with open(EQ_DB_PATH, "rb") as f:
-            eq_db = pickle.load(f)
-            return eq_db
+def get_eq_notify_db():
+    if os.path.exists(EQ_NOTIFY_DB_PATH):
+        with open(EQ_NOTIFY_DB_PATH, "rb") as f:
+            eq_notify_db = pickle.load(f)
+            return eq_notify_db
     else:
-        eq_db = {}
-        return eq_db
+        eq_notify_db = {}
+        return eq_notify_db
 
+
+def load_eq_db_to_df():
+    start_time = time.perf_counter()
+    logging.info("||=*=|| Loading EQ_DB to DataFrame ||=*=||")
+    eq_db: dict = get_eq_db()
+    column_names = ["earthquake_id",
+                    "place",
+                    "magnitude",
+                    "time",
+                    "url",
+                    "pager_alert_level",
+                    "tsunami_potential",
+                    "latitude",
+                    "longitude",
+                    ]
+
+    places_col = [row["place"] for row in eq_db.values()]
+    magnitude_col = [row["magnitude"] for row in eq_db.values()]
+    url_col = [row["url"] for row in eq_db.values()]
+    time_col = [row["time"] for row in eq_db.values()]
+    earthquake_id_col = [row["earthquake_id"] for row in eq_db.values()]
+    pager_alert_level_col = [row["pager_alert_level"] for row in eq_db.values()]
+    tsunami_potential_col = [row["tsunami_potential"] for row in eq_db.values()]
+    latitude_col = [row["latitude"] for row in eq_db.values()]
+    longitude_col = [row["longitude"] for row in eq_db.values()]
+
+    df_ready_dict = {"earthquake_id": earthquake_id_col,
+                     "place": places_col,
+                     "magnitude": magnitude_col,
+                     "url": url_col,
+                     "time": time_col,
+                     "pager_alert_level": pager_alert_level_col,
+                     "tsunami_potential": tsunami_potential_col,
+                     "latitude": latitude_col,
+                     "longitude": longitude_col,
+                     }
+    df = pd.DataFrame.from_dict(df_ready_dict)
+    end_time = time.perf_counter()
+    logging.info("||=*=|| DataFrame Ready in %.2f seconds. ||=*=||", end_time - start_time)
+    return df
 
 def plot_to_img_with_plotly(long, lat, place, mag):
     # Coordinates for New York City
@@ -153,6 +205,7 @@ class LiveTracking(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.guild_prefs = get_guild_prefs()
+        self.eq_notify_db = get_eq_notify_db()
         self.eq_db = get_eq_db()
         self.client.loop.create_task(self._initialize())
 
@@ -163,7 +216,8 @@ class LiveTracking(commands.Cog):
 
     async def _initialize(self):
         """This func is run when on LiveTracking __init__ is called.
-        Ensures eq_db and guild_prefs are loaded before starting the polling loop."""
+        Ensures eq_notify_db and guild_prefs are loaded before starting the polling loop."""
+
         # Create or set guild preferences
         for guild in self.client.guilds:
             if self.guild_prefs.get(str(guild.id)):
@@ -175,22 +229,47 @@ class LiveTracking(commands.Cog):
                                                "UpdateChannelId": 0,
                                                "PlotStyle": 0}
 
-        # Set eq_db guild.id default key object
+        # Set eq_notify_db guild.id default key object
         for guild in self.client.guilds:
-            if self.eq_db.get(str(guild.id)):
+            if self.eq_notify_db.get(str(guild.id)):
                 continue
-            self.eq_db[str(guild.id)] = {}
+            self.eq_notify_db[str(guild.id)] = {}
 
-            logging.info("Guild prefs at the end of  _initialize method. Guild prefs: ", self.guild_prefs)
+            # logging.info("Guild prefs at the end of  _initialize method. Guild prefs: ", self.guild_prefs)
 
         self.poll_quakes.start()
+
+
+    # If the earthquake id is not registered already, import the data to the self.eq_db object
+    async def save_earthquakes(self, list_of_features: list):
+        for feature in list_of_features:
+            eq_data = await self.get_earthquake_data(feature)
+            eq_id = eq_data.get("earthquake_id")
+
+            if not self.eq_db.get(eq_id):
+                logging.info("||=*=|| Saving Earthquake ||=*=|| " + eq_data["earthquake_id"])
+                self.eq_db[eq_id] = {
+                                        "pager_lvl_icon": eq_data["pager_lvl_icon"],
+                                        "place": eq_data["place"],
+                                        "magnitude": eq_data["magnitude"],
+                                        "url": eq_data["url"],
+                                        "time": eq_data["time"],
+                                        "earthquake_id": eq_data["earthquake_id"],
+                                        "pager_alert_level": eq_data["pager_alert_level"],
+                                        "tsunami_potential": eq_data["tsunami_potential"],
+                                        "depth": eq_data["depth"],
+                                        "latitude": eq_data["latitude"],
+                                        "longitude": eq_data["longitude"],
+                                        "significance": eq_data["significance"],
+                }
+                logging.info("||=*=|| Earthquake Saved! ||=*=|| ")
 
 
     async def notify_guild(self, features: list, guild: discord.Guild):
         for feature in features:
             eq_data = await self.get_earthquake_data(feature)
 
-            if self.eq_db[str(guild.id)].get(eq_data["earthquake_id"]):
+            if self.eq_notify_db[str(guild.id)].get(eq_data["earthquake_id"]):
                 continue
 
             #TODO set notify channel through config command
@@ -204,13 +283,13 @@ class LiveTracking(commands.Cog):
                     # Create and send the message
                     eq_embed, img_file = create_embed_quake_alert(eq_data)
                     await channel.send(embed=eq_embed, file=img_file)
-                    self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                    self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
                 case 1:
                     if eq_data["magnitude"] >= 1.0:
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<1.0), skipping message for guild: {guild}")
@@ -219,7 +298,7 @@ class LiveTracking(commands.Cog):
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<2.5), skipping message for guild: {guild}")
@@ -228,7 +307,7 @@ class LiveTracking(commands.Cog):
                         # Create and send the message
                         eq_embed, img_file = create_embed_quake_alert(eq_data)
                         await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<4.5), skipping message for guild: {guild}")
@@ -279,14 +358,14 @@ class LiveTracking(commands.Cog):
 
         # Initialize eq_data.guild earthquake records
         for guild in self.client.guilds:
-            if self.eq_db.get(str(guild.id)):
-                if self.eq_db.get(str(guild.id)).get(earthquake_id):
+            if self.eq_notify_db.get(str(guild.id)):
+                if self.eq_notify_db.get(str(guild.id)).get(earthquake_id):
                     continue
                 else:
                     # Register that we see the earthquake and set value to false
                     # This false value is acting as the answer to a question, has this guild.id
                     # reported on this earthquake
-                    self.eq_db[str(guild.id)][earthquake_id] = False
+                    self.eq_notify_db[str(guild.id)][earthquake_id] = False
 
         return {
             "pager_lvl_icon": pager_lvl_icon,
@@ -307,12 +386,17 @@ class LiveTracking(commands.Cog):
     @tasks.loop(seconds=60.0)
     async def poll_quakes(self):
         """Every 10 minutes, poll the api for new earthquakes. When a new quake is detected, add the quake_id
-        to the eq_db dictionary. If the guildid.quakeid = false, that guild has not reported on the eq
+        to the eq_notify_db dictionary. If the guildid.quakeid = false, that guild has not reported on the eq
         If the quake is in the dict, it will be ignored."""
         print("Guild prefs from start of poll quakes cmd: ", self.guild_prefs)
         start_time = time.perf_counter()
         logging.info("%s function initiated.", colorize("poll_quakes", "blue"))
 
+        # First fetch latest eq_db
+        self.eq_db = get_eq_db()
+        logging.info("%s loaded! %s total earthquakes on record.", colorize("eq_db", "yellow"), len(self.eq_db))
+        # logging.info("\n")
+        # logging.info(self.eq_db)
         await self.client.wait_until_ready()
         async with aiohttp.ClientSession() as session:
             async with session.get(LIVE_URL) as resp:
@@ -328,6 +412,9 @@ class LiveTracking(commands.Cog):
                     logging.info("No earthquakes detected in the last hour.")
                     return
 
+                # Save the earthquakes once after the HTTP pull
+                await self.save_earthquakes(feature_list)
+
                 for guild in self.client.guilds:
                     logging.info("Attempting to notify guild: %s", guild.name)
                     await self.notify_guild(feature_list, guild)
@@ -335,11 +422,35 @@ class LiveTracking(commands.Cog):
 
                 end_time = time.perf_counter()
 
-                # Save the eq_eb object to a binary file, Pickle it!
+                # Save the earthquake data to a binary file, Pickle it!
                 with open(EQ_DB_PATH, "wb") as f:
                     pickle.dump(self.eq_db, f)
+
+                # Save the eq_eb object to a binary file, Pickle it!
+                with open(EQ_NOTIFY_DB_PATH, "wb") as f:
+                    pickle.dump(self.eq_notify_db, f)
                 logging.info("%s function completed. Elapsed %.2f seconds.", colorize("poll_quakes", "blue"), end_time - start_time)
 
+    @commands.hybrid_command(name="top-10-largest-today")
+    async def top10(self, ctx: commands.Context):
+        _today =datetime.today().strftime("%B %d, %Y")
+        embed = discord.Embed(
+            title=f"Top 10 Earthquakes {_today}",
+            color=discord.Color.gold(),
+            )
+
+        df = load_eq_db_to_df()
+        df.sort_values(by=["magnitude"], ascending=False, inplace=True)
+        top10: pd.DataFrame = df[['place', 'magnitude']].head(10)
+
+        message_lines = []
+        line_count = 1
+        for _, row in top10.iterrows():
+            formatted_line = f"{row['place']:<50} | MAG:{row['magnitude']:>4}"
+            embed.add_field(name=f"#{line_count}", value=formatted_line, inline=False)
+            line_count += 1
+
+        await ctx.send(embed=embed)
 
     @commands.command()
     async def config(self, ctx: commands.Context):

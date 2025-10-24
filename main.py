@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 import colorlog
 
-version_number = "v0.10"
+version_number = "v0.12"
 
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 
@@ -38,9 +38,9 @@ client = commands.Bot(command_prefix=".", intents=intents)
 
 @client.event
 async def on_ready():
-    await client.tree.sync()
     await client.load_extension('cogs.live_tracking')
     await client.change_presence(activity=discord.Game(name='github.com/odinmay'))
+    await client.tree.sync()
 
 
 if __name__ == '__main__':
