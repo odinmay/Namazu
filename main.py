@@ -1,4 +1,5 @@
-"""This is the main file, which is executed first and handles connecting to the Namazu Bot application and loads cogs"""
+"""This is the main entry point, which is executed first and handles connecting to the
+Namazu Bot discord application, loads cogs, and establishes log formatting."""
 import logging
 import sys
 import os
@@ -7,7 +8,7 @@ import discord
 from discord.ext import commands
 import colorlog
 
-version_number = "v0.12"
+VERSION_NUMBER = "v0.13"
 
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 
@@ -15,7 +16,8 @@ DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 logger = logging.getLogger("discord")
 console_handler = logging.StreamHandler(sys.stdout)
 console_formatter = colorlog.ColoredFormatter(
-    "%(log_color)s[%(asctime)s.%(msecs)03d] [%(levelname)s]%(reset)s %(message_log_color)s%(message)s",
+    "%(log_color)s[%(asctime)s.%(msecs)03d] "
+    "[%(levelname)s]%(reset)s %(message_log_color)s%(message)s",
     datefmt="%H:%M:%S",
     log_colors={
         "DEBUG": "cyan",
@@ -38,11 +40,16 @@ client = commands.Bot(command_prefix=".", intents=intents)
 
 @client.event
 async def on_ready():
+    """Runs when the bot is ready, loads cogs, set presence message, and sync command tree."""
     await client.load_extension('cogs.live_tracking')
     await client.change_presence(activity=discord.Game(name='github.com/odinmay'))
     await client.tree.sync()
 
 
 if __name__ == '__main__':
-    logger.info("Namazu " + version_number)
-    client.run(DISCORD_SECRET, log_level=logging.INFO, root_logger=True, log_handler=console_handler, log_formatter=console_formatter)
+    logger.info("Namazu %s", VERSION_NUMBER)
+    client.run(DISCORD_SECRET,
+               log_level=logging.INFO,
+               root_logger=True,
+               log_handler=console_handler,
+               log_formatter=console_formatter)
