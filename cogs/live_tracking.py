@@ -1,6 +1,6 @@
 """Everything related to live tracking is in this cog. The poll_quakes function is the main logic"""
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import pickle
 import logging
@@ -520,6 +520,35 @@ class LiveTracking(commands.Cog):
 
         await ctx.send(embed=embed)
 
+
+    @commands.hybrid_command(name="top-10-largest-30days", aliases=["top10month"])
+    async def top10month(self, ctx: commands.Context):
+        """Send an embed message to the channel containing
+         the top 10 earthquakes from the last 30 days."""
+        df = load_eq_db_to_df()
+        df["time"] = pd.to_datetime(df["time"])
+
+        now = datetime.now()
+        cutoff = now - timedelta(days=30)
+        df_last_30 = df[df["time"] >= cutoff].copy()
+
+        embed = discord.Embed(
+            title="Top 10 Largest Earthquakes (Last 30 Days)",
+            color=discord.Color.gold(),
+        )
+
+        df_last_30.sort_values(by=["magnitude"], ascending=False, inplace=True)
+        top10: pd.DataFrame = df_last_30[['place', 'magnitude']].head(10)
+
+        line_count = 1
+        for _, row in top10.iterrows():
+            formatted_line = f"{row['place']:<50} | MAG:{row['magnitude']:>4}"
+            embed.add_field(name=f"#{line_count}", value=formatted_line, inline=False)
+            line_count += 1
+
+        await ctx.send(embed=embed)
+
+
     @commands.hybrid_command(name="today")
     async def today(self, ctx: commands.Context):
         """Output a summary of today's earthquakes.
@@ -547,6 +576,28 @@ class LiveTracking(commands.Cog):
         embed.add_field(name="Lowest Magnitude",
                         value=f"{df_today['magnitude'].min():.2f}",
                         inline=True)
+
+        img_file = discord.File("eq_plot_all_today.png", filename="earthquake.png")
+        embed.set_image(url="attachment://earthquake.png")
+
+        await ctx.send(embed=embed, file=img_file)
+
+
+    @commands.hybrid_command(name="maptoday")
+    async def maptoday(self, ctx: commands.Context):
+        """Plot all earthquakes from today on a flat map and send as message."""
+        df = load_eq_db_to_df()
+        df["time"] = pd.to_datetime(df["time"])
+        df["date"] = df["time"].dt.date
+        today = datetime.today().date()
+        df_today = df[df["date"] == today].copy()
+
+        plot_daily_earthquakes(df_today)
+
+        embed = discord.Embed(
+            title=f"Earthquakes Today ({today.strftime('%B %d, %Y')})",
+            color=discord.Color.gold(),
+        )
 
         img_file = discord.File("eq_plot_all_today.png", filename="earthquake.png")
         embed.set_image(url="attachment://earthquake.png")
