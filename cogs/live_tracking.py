@@ -7,6 +7,8 @@ import logging
 import time
 import os
 import sqlite3
+import csv
+import io
 
 from colorlog.escape_codes import escape_codes as c
 from discord.ext import tasks, commands
@@ -24,6 +26,7 @@ GUILD_PREFS_PATH = "data/guild_prefs.pkl"
 EQ_NOTIFY_DB_PATH = "data/eq_notify_db.pkl"
 EQ_DB_PATH = "data/eq_db1.pkl"
 SQLITE_DB_PATH = "data/namazu.db"
+DISCORD_FILE_LIMIT_BYTES = 10 * 1024 * 1024
 
 
 def ensure_data_dir():
@@ -260,6 +263,97 @@ def migrate_pickle_data_if_needed():
         with open(EQ_NOTIFY_DB_PATH, "rb") as f:
             save_eq_notify_db_to_sqlite(pickle.load(f))
         logger.info("Migrated notify db from %s to sqlite.", EQ_NOTIFY_DB_PATH)
+
+
+def format_bytes(size_bytes: int):
+    """Format byte count into a human-readable size string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+def _csv_row_to_bytes(row: tuple):
+    """Serialize a single CSV row to UTF-8 bytes."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(row)
+    return buf.getvalue().encode("utf-8")
+
+
+def fetch_earthquake_export_data():
+    """Fetch all earthquake records and summary stats for CSV export."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        summary_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS quake_count,
+                AVG(magnitude) AS avg_magnitude,
+                MIN(magnitude) AS min_magnitude,
+                MAX(magnitude) AS max_magnitude
+            FROM earthquakes
+            """
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT earthquake_id, pager_lvl_icon, place, magnitude, url, time,
+                   pager_alert_level, tsunami_potential, depth, latitude, longitude, significance
+            FROM earthquakes
+            ORDER BY time ASC
+            """
+        ).fetchall()
+
+    return {
+        "count": summary_row[0] or 0,
+        "avg_magnitude": summary_row[1],
+        "min_magnitude": summary_row[2],
+        "max_magnitude": summary_row[3],
+        "rows": rows,
+    }
+
+
+def build_earthquake_csv_parts(rows: list[tuple], max_bytes: int = DISCORD_FILE_LIMIT_BYTES):
+    """Split earthquake rows into CSV byte chunks that stay under max_bytes."""
+    header = (
+        "earthquake_id",
+        "pager_lvl_icon",
+        "place",
+        "magnitude",
+        "url",
+        "time",
+        "pager_alert_level",
+        "tsunami_potential",
+        "depth",
+        "latitude",
+        "longitude",
+        "significance",
+    )
+    header_bytes = _csv_row_to_bytes(header)
+    parts = []
+    current_bytes = bytearray(header_bytes)
+    current_rows = 0
+
+    for row in rows:
+        row_bytes = _csv_row_to_bytes(row)
+        next_size = len(current_bytes) + len(row_bytes)
+
+        if next_size > max_bytes and current_rows > 0:
+            parts.append({"bytes": bytes(current_bytes), "row_count": current_rows})
+            current_bytes = bytearray(header_bytes)
+            current_rows = 0
+
+        if len(header_bytes) + len(row_bytes) > max_bytes:
+            raise ValueError("A single row exceeds the 10MB Discord file size limit.")
+
+        current_bytes.extend(row_bytes)
+        current_rows += 1
+
+    if current_rows > 0:
+        parts.append({"bytes": bytes(current_bytes), "row_count": current_rows})
+
+    return parts
 
 
 def load_eq_db_to_df():
@@ -801,6 +895,62 @@ class LiveTracking(commands.Cog):
         embed.set_image(url="attachment://earthquake.png")
 
         await ctx.send(embed=embed, file=img_file)
+
+
+    @commands.hybrid_command(name="export-earthquakes", aliases=["exporteqcsv", "exportcsv"])
+    async def export_earthquakes(self, ctx: commands.Context):
+        """Export all earthquake records to CSV and upload files to the current channel."""
+        if ctx.interaction is not None:
+            await ctx.defer()
+
+        export_data = fetch_earthquake_export_data()
+        total_quakes = export_data["count"]
+
+        if total_quakes == 0:
+            await ctx.send("No earthquake data is available to export.")
+            return
+
+        try:
+            csv_parts = build_earthquake_csv_parts(export_data["rows"])
+        except ValueError as err:
+            await ctx.send(f"Export failed: {err}")
+            return
+
+        split_count = len(csv_parts)
+        total_csv_bytes = sum(len(part["bytes"]) for part in csv_parts)
+        avg_mag = export_data["avg_magnitude"]
+        min_mag = export_data["min_magnitude"]
+        max_mag = export_data["max_magnitude"]
+
+        avg_mag_str = f"{avg_mag:.2f}" if avg_mag is not None else "N/A"
+        min_mag_str = f"{min_mag:.2f}" if min_mag is not None else "N/A"
+        max_mag_str = f"{max_mag:.2f}" if max_mag is not None else "N/A"
+
+        summary = (
+            f"Earthquake export ready.\n"
+            f"Rows: {total_quakes:,}\n"
+            f"Average magnitude: {avg_mag_str}\n"
+            f"Min magnitude: {min_mag_str}\n"
+            f"Max magnitude: {max_mag_str}\n"
+            f"Total CSV size: {format_bytes(total_csv_bytes)} ({total_csv_bytes:,} bytes)\n"
+            f"Split count: {split_count} file(s)\n"
+            f"Per-file limit: {format_bytes(DISCORD_FILE_LIMIT_BYTES)} hard max"
+        )
+        await ctx.send(summary)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for idx, part in enumerate(csv_parts, start=1):
+            filename = f"earthquakes_export_{timestamp}_part{idx:03d}.csv"
+            payload = io.BytesIO(part["bytes"])
+            csv_file = discord.File(payload, filename=filename)
+            await ctx.send(
+                content=(
+                    f"Export file {idx}/{split_count} | "
+                    f"Rows: {part['row_count']:,} | "
+                    f"Size: {format_bytes(len(part['bytes']))} ({len(part['bytes']):,} bytes)"
+                ),
+                file=csv_file,
+            )
 
 
     @commands.hybrid_command(name="config")
