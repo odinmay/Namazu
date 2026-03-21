@@ -27,6 +27,72 @@ EQ_NOTIFY_DB_PATH = "data/eq_notify_db.pkl"
 EQ_DB_PATH = "data/eq_db1.pkl"
 SQLITE_DB_PATH = "data/namazu.db"
 DISCORD_FILE_LIMIT_BYTES = 10 * 1024 * 1024
+DEFAULT_MAP_LONGITUDE = -74.00
+DEFAULT_MAP_LATITUDE = 40.71
+MAP_STYLE_OPTIONS = [
+    {
+        "label": "OpenStreetMap",
+        "map_style": "open-street-map",
+        "font_color": "black",
+        "paper_bgcolor": "white",
+    },
+    {
+        "label": "Carto Positron",
+        "map_style": "carto-positron",
+        "font_color": "black",
+        "paper_bgcolor": "white",
+    },
+    {
+        "label": "Carto Darkmatter",
+        "map_style": "carto-darkmatter",
+        "font_color": "white",
+        "paper_bgcolor": "#232328",
+    },
+    {
+        "label": "White Background",
+        "map_style": "white-bg",
+        "font_color": "black",
+        "paper_bgcolor": "white",
+    },
+]
+NUMBER_REACTIONS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+ISLAND_REGION_KEYWORDS = [
+    "hawaii",
+    "puerto rico",
+    "guam",
+    "south sandwich islands",
+    "solomon islands",
+    "papua new guinea",
+    "new zealand",
+    "tonga",
+    "vanuatu",
+    "philippines",
+    "indonesia",
+    "timor leste",
+    "trinidad and tobago",
+    "beaufort sea",
+]
+
+
+def get_default_guild_prefs():
+    return {"MinMagnitude": 3, "UpdateFrequency": 0, "UpdateChannelId": 0, "PlotStyle": 0}
+
+
+def get_map_style_option(plot_style_idx: int):
+    if 0 <= plot_style_idx < len(MAP_STYLE_OPTIONS):
+        return MAP_STYLE_OPTIONS[plot_style_idx], plot_style_idx
+    return MAP_STYLE_OPTIONS[0], 0
+
+
+def sanitize_filename(value: str):
+    return "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in value)
+
+
+def get_single_quake_zoom(place: str, default_zoom=2.1):
+    place_lower = str(place).lower()
+    if any(keyword in place_lower for keyword in ISLAND_REGION_KEYWORDS):
+        return 4.0
+    return default_zoom
 
 
 def ensure_data_dir():
@@ -387,54 +453,39 @@ def load_eq_db_to_df():
     logging.info("||=*=|| DataFrame Ready in %.2f seconds. ||=*=||", end_time - start_time)
     return df
 
-def plot_to_img_with_plotly(long, lat, place, mag):
-    """Plot the single earthquake to a map and save the image."""
-    label = mag
-
-    # Create the figure
-    fig = go.Figure()
-
-    # Add the point
-    fig.add_trace(go.Scattergeo(
-        lon = [long],
-        lat = [lat],
-        text = label,
-        mode = 'markers',
-        marker=dict(size=6, color='red'),
-        textposition="bottom left",
-        textfont={"weight":700, "size":16, "color":'black'},
-        hoverinfo='text',
-    ))
-
-    # Configure the globe layout
-    fig.update_geos(
-        projection_type="natural earth",  # Globe-style
-        projection_scale=0.90,
-        showcountries=True,
-        showcoastlines=True,
-        showland=True,
-        landcolor="lightgray",
-        oceancolor="lightblue",
-        showocean=True,
-        bgcolor="#232328"
-    )
-    title_str = "Magnitude: " + str(mag) + " " +  place
+def plot_to_img_with_plotly(long, lat, place, mag, filename="eq_plot.png", plot_style=0):
+    """Plot a single earthquake point and save as an image."""
+    style, _ = get_map_style_option(plot_style)
+    map_zoom = get_single_quake_zoom(place)
+    title_str = "Magnitude: " + str(mag) + " " + place
     if len(title_str) > 35:
         title_str = "Magnitude: " + str(mag) + "\n" + place
 
-    # Set layout
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattermap(
+            lon=[long],
+            lat=[lat],
+            mode="markers",
+            marker={"size": 11, "color": "red"},
+            hovertemplate=f"Magnitude {mag}<br>{place}<extra></extra>",
+        )
+    )
+
     fig.update_layout(
         title=title_str,
-        font={"color": 'white'},
-        margin={"r":0,"t":30,"l":0,"b":0},
-        geo=dict(
-            projection_rotation=dict(lon=long, lat=lat) # Center globe on the point
-        ),
-        paper_bgcolor="#232328",
-        plot_bgcolor="#232328",
+        font={"color": style["font_color"]},
+        margin={"r": 0, "t": 30, "l": 0, "b": 0},
+        map={
+            "style": style["map_style"],
+            "center": {"lon": long, "lat": lat},
+            "zoom": map_zoom,
+        },
+        paper_bgcolor=style["paper_bgcolor"],
+        plot_bgcolor=style["paper_bgcolor"],
+        showlegend=False,
     )
-    # Save to PNG
-    fig.write_image("eq_plot.png", width=400, height=250)
+    fig.write_image(filename, width=400, height=250)
 
 
 def colorize(text, color):
@@ -442,12 +493,16 @@ def colorize(text, color):
     return f"{c[color]}{text}{c['reset']}"
 
 
-def create_embed_quake_alert(earthquake_data: dict):
+def create_embed_quake_alert(earthquake_data: dict, plot_style=0, image_path="eq_plot.png"):
     # Check on the color and make embed the color, else make it gray
-    plot_to_img_with_plotly(earthquake_data["longitude"],
-                            earthquake_data["latitude"],
-                            earthquake_data["place"],
-                            earthquake_data["magnitude"])
+    plot_to_img_with_plotly(
+        earthquake_data["longitude"],
+        earthquake_data["latitude"],
+        earthquake_data["place"],
+        earthquake_data["magnitude"],
+        filename=image_path,
+        plot_style=plot_style,
+    )
 
     match earthquake_data["pager_alert_level"]:
         case "green":
@@ -497,7 +552,7 @@ def create_embed_quake_alert(earthquake_data: dict):
                         value=pager_alert,
                         inline=False)
 
-    img_file = discord.File("eq_plot.png", filename="earthquake.png")
+    img_file = discord.File(image_path, filename="earthquake.png")
     embed.set_image(url="attachment://earthquake.png")
 
     embed.add_field(name="Time",
@@ -506,45 +561,38 @@ def create_embed_quake_alert(earthquake_data: dict):
     return embed, img_file
 
 
-def plot_daily_earthquakes(eq_df: pd.DataFrame):
-    # Create the figure
+def plot_daily_earthquakes(eq_df: pd.DataFrame, filename="eq_plot_all_today.png", plot_style=0):
+    style, _ = get_map_style_option(plot_style)
+    has_rows = not eq_df.empty
+
+    center_lon = float(eq_df["longitude"].mean()) if has_rows else DEFAULT_MAP_LONGITUDE
+    center_lat = float(eq_df["latitude"].mean()) if has_rows else DEFAULT_MAP_LATITUDE
+    zoom = 0.65 if has_rows else 2.1
+
     fig = go.Figure()
-
-    # Add the point
-    fig.add_trace(go.Scattergeo(
-        lon=eq_df["longitude"],
-        lat=eq_df["latitude"],
-        mode='markers',
-        marker={"size":5, "color":'red'},
-        textposition="bottom left",
-        textfont={"weight":700, "size":16, "color":"black"},
-        hoverinfo='text',
-    ))
-
-    # Configure the globe layout
-    fig.update_geos(
-        projection_type="natural earth",  # Globe-style
-        projection_scale=1.0,
-        showcountries=True,
-        showcoastlines=True,
-        showland=True,
-        landcolor="lightgray",
-        oceancolor="lightblue",
-        showocean=True,
-        bgcolor="#232328"
+    fig.add_trace(
+        go.Scattermap(
+            lon=eq_df["longitude"] if has_rows else [DEFAULT_MAP_LONGITUDE],
+            lat=eq_df["latitude"] if has_rows else [DEFAULT_MAP_LATITUDE],
+            mode="markers",
+            marker={"size": 7 if has_rows else 10, "color": "red"},
+            hoverinfo="skip",
+        )
     )
 
-    # Set layout
     fig.update_layout(
-        font=dict(
-            color='white'
-        ),
+        font={"color": style["font_color"]},
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
-        paper_bgcolor="#232328",
-        plot_bgcolor="#232328",
+        map={
+            "style": style["map_style"],
+            "center": {"lon": center_lon, "lat": center_lat},
+            "zoom": zoom,
+        },
+        paper_bgcolor=style["paper_bgcolor"],
+        plot_bgcolor=style["paper_bgcolor"],
+        showlegend=False,
     )
-    # Save to PNG
-    fig.write_image("eq_plot_all_today.png", width=400, height=250)
+    fig.write_image(filename, width=400, height=250)
 
 
 class LiveTracking(commands.Cog):
@@ -557,6 +605,10 @@ class LiveTracking(commands.Cog):
         self.eq_db = get_eq_db()
         self.client.loop.create_task(self._initialize())
 
+    def _ensure_guild_pref(self, guild_id: str):
+        if not self.guild_prefs.get(guild_id):
+            self.guild_prefs[guild_id] = get_default_guild_prefs()
+
 
     def cog_unload(self):
         self.poll_quakes.cancel()
@@ -568,14 +620,7 @@ class LiveTracking(commands.Cog):
 
         # Create or set guild preferences
         for guild in self.client.guilds:
-            if self.guild_prefs.get(str(guild.id)):
-                continue
-
-            # Set default prefs if not in the prefs dict
-            self.guild_prefs[str(guild.id)] = {"MinMagnitude": 3,
-                                               "UpdateFrequency": 0,
-                                               "UpdateChannelId": 0,
-                                               "PlotStyle": 0}
+            self._ensure_guild_pref(str(guild.id))
 
         # Set eq_notify_db guild.id default key object
         for guild in self.client.guilds:
@@ -614,10 +659,30 @@ class LiveTracking(commands.Cog):
 
 
     async def notify_guild(self, features: list, guild: discord.Guild):
+        guild_id = str(guild.id)
+        self._ensure_guild_pref(guild_id)
+        if not self.eq_notify_db.get(guild_id):
+            self.eq_notify_db[guild_id] = {}
+        plot_style = self.guild_prefs[guild_id].get("PlotStyle", 0)
+
+        async def send_alert(eq_data: dict):
+            image_path = f"eq_plot_{guild_id}_{sanitize_filename(eq_data['earthquake_id'])}.png"
+            eq_embed, img_file = create_embed_quake_alert(
+                eq_data,
+                plot_style=plot_style,
+                image_path=image_path,
+            )
+            try:
+                await channel.send(embed=eq_embed, file=img_file)
+            finally:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            self.eq_notify_db[guild_id][eq_data["earthquake_id"]] = True
+
         for feature in features:
             eq_data = await self.get_earthquake_data(feature)
 
-            if self.eq_notify_db[str(guild.id)].get(eq_data["earthquake_id"]):
+            if self.eq_notify_db[guild_id].get(eq_data["earthquake_id"]):
                 continue
 
             channel = get(guild.text_channels, name="quake-updates")
@@ -625,18 +690,12 @@ class LiveTracking(commands.Cog):
                 return
 
             # Filter the earthquake by guild preferred reporting magnitude
-            match self.guild_prefs[str(guild.id)]["MinMagnitude"]:
+            match self.guild_prefs[guild_id]["MinMagnitude"]:
                 case 0:
-                    # Create and send the message
-                    eq_embed, img_file = create_embed_quake_alert(eq_data)
-                    await channel.send(embed=eq_embed, file=img_file)
-                    self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                    await send_alert(eq_data)
                 case 1:
                     if eq_data["magnitude"] >= 1.0:
-                        # Create and send the message
-                        eq_embed, img_file = create_embed_quake_alert(eq_data)
-                        await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        await send_alert(eq_data)
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<1.0)"
@@ -644,10 +703,7 @@ class LiveTracking(commands.Cog):
                             guild,)
                 case 2:
                     if eq_data["magnitude"] >= 2.5:
-                        # Create and send the message
-                        eq_embed, img_file = create_embed_quake_alert(eq_data)
-                        await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        await send_alert(eq_data)
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<2.5)"
@@ -656,10 +712,7 @@ class LiveTracking(commands.Cog):
                 case 3:
                     # User selected option 3: (4.5 or larger)
                     if eq_data["magnitude"] >= 4.5:
-                        # Create and send the message
-                        eq_embed, img_file = create_embed_quake_alert(eq_data)
-                        await channel.send(embed=eq_embed, file=img_file)
-                        self.eq_notify_db[str(guild.id)][eq_data["earthquake_id"]] = True
+                        await send_alert(eq_data)
                     else:
                         logging.info(
                             f"Magnitude {eq_data['magnitude']} is too low (<4.5)"
@@ -851,7 +904,11 @@ class LiveTracking(commands.Cog):
         today = datetime.today().date()
         df_today = df[df["date"] == today]  # Filter for today's data only
 
-        plot_daily_earthquakes(df_today)
+        plot_style = 0
+        if ctx.guild is not None:
+            self._ensure_guild_pref(str(ctx.guild.id))
+            plot_style = self.guild_prefs[str(ctx.guild.id)]["PlotStyle"]
+        plot_daily_earthquakes(df_today, plot_style=plot_style)
         title_str = (f"Total Eathquakes Today: {len(df_today)}\n "
                      f">= Magnitude 3: {len(df_today[df_today['magnitude'] >= 3.0])}")
         embed = discord.Embed(
@@ -884,7 +941,11 @@ class LiveTracking(commands.Cog):
         today = datetime.today().date()
         df_today = df[df["date"] == today].copy()
 
-        plot_daily_earthquakes(df_today)
+        plot_style = 0
+        if ctx.guild is not None:
+            self._ensure_guild_pref(str(ctx.guild.id))
+            plot_style = self.guild_prefs[str(ctx.guild.id)]["PlotStyle"]
+        plot_daily_earthquakes(df_today, plot_style=plot_style)
 
         embed = discord.Embed(
             title=f"Earthquakes Today ({today.strftime('%B %d, %Y')})",
@@ -952,10 +1013,116 @@ class LiveTracking(commands.Cog):
                 file=csv_file,
             )
 
+    @commands.hybrid_command(name="config_map")
+    async def config_map(self, ctx: commands.Context):
+        """Configure the map style for this guild with reaction-based style previews."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        if ctx.interaction is not None:
+            await ctx.defer()
+
+        if len(MAP_STYLE_OPTIONS) > len(NUMBER_REACTIONS):
+            await ctx.send("Too many map styles are configured for the available number reactions.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        self._ensure_guild_pref(guild_id)
+
+        files = []
+        embeds = []
+        preview_paths = []
+        style_lines = []
+        reaction_to_style = {}
+
+        try:
+            for idx, style in enumerate(MAP_STYLE_OPTIONS):
+                emoji = NUMBER_REACTIONS[idx]
+                reaction_to_style[emoji] = idx
+                style_lines.append(f"{emoji} | {style['label']} (`{style['map_style']}`)")
+
+                preview_path = f"map_style_preview_{guild_id}_{idx}.png"
+                preview_paths.append(preview_path)
+
+                plot_to_img_with_plotly(
+                    DEFAULT_MAP_LONGITUDE,
+                    DEFAULT_MAP_LATITUDE,
+                    "Example Location",
+                    "Preview",
+                    filename=preview_path,
+                    plot_style=idx,
+                )
+
+                attachment_name = f"map_style_{idx}.png"
+                files.append(discord.File(preview_path, filename=attachment_name))
+
+                embed = discord.Embed(
+                    title=f"{emoji} {style['label']}",
+                    description=f"`{style['map_style']}`",
+                    color=discord.Color.blurple(),
+                )
+                embed.set_image(url=f"attachment://{attachment_name}")
+                embeds.append(embed)
+        except Exception as err:
+            for path in preview_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            await ctx.send(f"Unable to generate map style previews: {err}")
+            return
+
+        prompt = (
+            "Choose a map style for this server by reacting with a number.\n"
+            "Preview coordinate: (-74.00, 40.71)\n\n"
+            + "\n".join(style_lines)
+        )
+
+        try:
+            msg = await ctx.send(content=prompt, embeds=embeds, files=files)
+        finally:
+            for path in preview_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+
+        for emoji in reaction_to_style:
+            await msg.add_reaction(emoji)
+
+        def check(reaction, usr):
+            return (
+                usr.id == ctx.author.id
+                and reaction.message.id == msg.id
+                and str(reaction.emoji) in reaction_to_style
+            )
+
+        try:
+            reaction, usr = await self.client.wait_for(
+                "reaction_add",
+                timeout=120.0,
+                check=check,
+            )
+            logging.info("Reaction : %s, user: %s", reaction, usr.name)
+        except asyncio.TimeoutError:
+            await ctx.send("Timed out. You must re-run /config_map and react within 2 minutes.")
+            return
+
+        selected_style_idx = reaction_to_style[str(reaction.emoji)]
+        self.guild_prefs[guild_id]["PlotStyle"] = selected_style_idx
+        save_guild_prefs_to_sqlite(self.guild_prefs)
+        selected_style, _ = get_map_style_option(selected_style_idx)
+        await ctx.send(
+            f"Map style set to {selected_style['label']} (`{selected_style['map_style']}`) "
+            "for this server."
+        )
+
 
     @commands.hybrid_command(name="config")
     async def config(self, ctx: commands.Context):
         """Configure the bots settings for a specific guild."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        self._ensure_guild_pref(str(ctx.guild.id))
 
         msg = await ctx.send(
             "Please choose a minimum magnitude to report on.\n\n"
@@ -971,9 +1138,17 @@ class LiveTracking(commands.Cog):
             await msg.add_reaction(reaction)
 
         try:
+            def check(reaction, usr):
+                return (
+                    usr.id == ctx.author.id
+                    and reaction.message.id == msg.id
+                    and str(reaction.emoji) in reactions
+                )
+
             reaction, usr = await self.client.wait_for(
                 "reaction_add",
-                timeout=60.0
+                timeout=60.0,
+                check=check,
             )
 
             logging.info(f"Reaction : %s, user: %s", reaction, usr.name)
