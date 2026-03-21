@@ -6,6 +6,7 @@ import pickle
 import logging
 import time
 import os
+import sqlite3
 
 from colorlog.escape_codes import escape_codes as c
 from discord.ext import tasks, commands
@@ -22,45 +23,243 @@ LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.g
 GUILD_PREFS_PATH = "data/guild_prefs.pkl"
 EQ_NOTIFY_DB_PATH = "data/eq_notify_db.pkl"
 EQ_DB_PATH = "data/eq_db1.pkl"
+SQLITE_DB_PATH = "data/namazu.db"
+
+
+def ensure_data_dir():
+    os.makedirs("data", exist_ok=True)
+
+
+def get_sqlite_conn():
+    ensure_data_dir()
+    return sqlite3.connect(SQLITE_DB_PATH)
+
+
+def init_sqlite():
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_prefs (
+                guild_id TEXT PRIMARY KEY,
+                min_magnitude INTEGER NOT NULL DEFAULT 3,
+                update_frequency INTEGER NOT NULL DEFAULT 0,
+                update_channel_id INTEGER NOT NULL DEFAULT 0,
+                plot_style INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS eq_notify (
+                guild_id TEXT NOT NULL,
+                earthquake_id TEXT NOT NULL,
+                notified INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, earthquake_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS earthquakes (
+                earthquake_id TEXT PRIMARY KEY,
+                pager_lvl_icon TEXT,
+                place TEXT,
+                magnitude REAL,
+                url TEXT,
+                time TEXT,
+                pager_alert_level TEXT,
+                tsunami_potential INTEGER,
+                depth TEXT,
+                latitude REAL,
+                longitude REAL,
+                significance INTEGER
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_eq_db_to_sqlite(eq_db: dict):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO earthquakes (
+                earthquake_id, pager_lvl_icon, place, magnitude, url, time,
+                pager_alert_level, tsunami_potential, depth, latitude, longitude, significance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(earthquake_id) DO UPDATE SET
+                pager_lvl_icon=excluded.pager_lvl_icon,
+                place=excluded.place,
+                magnitude=excluded.magnitude,
+                url=excluded.url,
+                time=excluded.time,
+                pager_alert_level=excluded.pager_alert_level,
+                tsunami_potential=excluded.tsunami_potential,
+                depth=excluded.depth,
+                latitude=excluded.latitude,
+                longitude=excluded.longitude,
+                significance=excluded.significance
+            """,
+            [
+                (
+                    eq_id,
+                    row.get("pager_lvl_icon"),
+                    row.get("place"),
+                    row.get("magnitude"),
+                    row.get("url"),
+                    row.get("time"),
+                    row.get("pager_alert_level"),
+                    int(bool(row.get("tsunami_potential"))),
+                    row.get("depth"),
+                    row.get("latitude"),
+                    row.get("longitude"),
+                    row.get("significance"),
+                )
+                for eq_id, row in eq_db.items()
+            ],
+        )
+        conn.commit()
+
+
+def save_guild_prefs_to_sqlite(guild_prefs: dict):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO guild_prefs (
+                guild_id, min_magnitude, update_frequency, update_channel_id, plot_style
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                min_magnitude=excluded.min_magnitude,
+                update_frequency=excluded.update_frequency,
+                update_channel_id=excluded.update_channel_id,
+                plot_style=excluded.plot_style
+            """,
+            [
+                (
+                    guild_id,
+                    prefs.get("MinMagnitude", 3),
+                    prefs.get("UpdateFrequency", 0),
+                    prefs.get("UpdateChannelId", 0),
+                    prefs.get("PlotStyle", 0),
+                )
+                for guild_id, prefs in guild_prefs.items()
+            ],
+        )
+        conn.commit()
+
+
+def save_eq_notify_db_to_sqlite(eq_notify_db: dict):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        rows = [
+            (guild_id, earthquake_id, int(bool(notified)))
+            for guild_id, guild_data in eq_notify_db.items()
+            for earthquake_id, notified in guild_data.items()
+        ]
+        conn.executemany(
+            """
+            INSERT INTO eq_notify (guild_id, earthquake_id, notified)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, earthquake_id) DO UPDATE SET
+                notified=excluded.notified
+            """,
+            rows,
+        )
+        conn.commit()
 
 
 def get_eq_db():
-    """Load or create a binary file which we use to store our persistent objects"""
-    if os.path.exists(EQ_DB_PATH):
-        with open(EQ_DB_PATH, "rb") as f:
-            eq_db = pickle.load(f)
-            return eq_db
-    else:
-        with open(EQ_DB_PATH, "wb") as f:
-            eq_db = {}
-            pickle.dump(eq_db, f)
-            return eq_db
+    """Load earthquakes from sqlite and return in legacy dict format."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT earthquake_id, pager_lvl_icon, place, magnitude, url, time,
+                   pager_alert_level, tsunami_potential, depth, latitude, longitude, significance
+            FROM earthquakes
+            """
+        ).fetchall()
+    return {
+        row[0]: {
+            "earthquake_id": row[0],
+            "pager_lvl_icon": row[1],
+            "place": row[2],
+            "magnitude": row[3],
+            "url": row[4],
+            "time": row[5],
+            "pager_alert_level": row[6],
+            "tsunami_potential": bool(row[7]),
+            "depth": row[8],
+            "latitude": row[9],
+            "longitude": row[10],
+            "significance": row[11],
+        }
+        for row in rows
+    }
 
 
 def get_guild_prefs():
-    """Load guild prefs from the serial file and return the object"""
-    if os.path.exists(GUILD_PREFS_PATH):
-        with open(GUILD_PREFS_PATH, "rb") as f:
-            guild_prefs = pickle.load(f)
-            return guild_prefs
-    else:
-        with open(GUILD_PREFS_PATH, "wb") as f:
-            guild_prefs = {}
-            pickle.dump(guild_prefs, f)
-            return guild_prefs
+    """Load guild preferences from sqlite and return in legacy dict format."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT guild_id, min_magnitude, update_frequency, update_channel_id, plot_style
+            FROM guild_prefs
+            """
+        ).fetchall()
+    return {
+        row[0]: {
+            "MinMagnitude": row[1],
+            "UpdateFrequency": row[2],
+            "UpdateChannelId": row[3],
+            "PlotStyle": row[4],
+        }
+        for row in rows
+    }
 
 
 def get_eq_notify_db():
-    """Load or create a binary file which we use to store our persistent objects"""
-    if os.path.exists(EQ_NOTIFY_DB_PATH):
+    """Load guild earthquake notify state from sqlite and return in legacy dict format."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT guild_id, earthquake_id, notified
+            FROM eq_notify
+            """
+        ).fetchall()
+
+    eq_notify_db = {}
+    for guild_id, earthquake_id, notified in rows:
+        eq_notify_db.setdefault(guild_id, {})[earthquake_id] = bool(notified)
+    return eq_notify_db
+
+
+def migrate_pickle_data_if_needed():
+    """One-time migration: if sqlite tables are empty, import legacy pickle data."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        earthquakes_count = conn.execute("SELECT COUNT(*) FROM earthquakes").fetchone()[0]
+        prefs_count = conn.execute("SELECT COUNT(*) FROM guild_prefs").fetchone()[0]
+        notify_count = conn.execute("SELECT COUNT(*) FROM eq_notify").fetchone()[0]
+
+    if earthquakes_count == 0 and os.path.exists(EQ_DB_PATH):
+        with open(EQ_DB_PATH, "rb") as f:
+            save_eq_db_to_sqlite(pickle.load(f))
+        logger.info("Migrated earthquake records from %s to sqlite.", EQ_DB_PATH)
+
+    if prefs_count == 0 and os.path.exists(GUILD_PREFS_PATH):
+        with open(GUILD_PREFS_PATH, "rb") as f:
+            save_guild_prefs_to_sqlite(pickle.load(f))
+        logger.info("Migrated guild prefs from %s to sqlite.", GUILD_PREFS_PATH)
+
+    if notify_count == 0 and os.path.exists(EQ_NOTIFY_DB_PATH):
         with open(EQ_NOTIFY_DB_PATH, "rb") as f:
-            eq_notify_db = pickle.load(f)
-            return eq_notify_db
-    else:
-        with open(EQ_NOTIFY_DB_PATH, "wb") as f:
-            eq_notify_db = {}
-            pickle.dump(eq_notify_db, f)
-            return eq_notify_db
+            save_eq_notify_db_to_sqlite(pickle.load(f))
+        logger.info("Migrated notify db from %s to sqlite.", EQ_NOTIFY_DB_PATH)
 
 
 def load_eq_db_to_df():
@@ -257,6 +456,8 @@ def plot_daily_earthquakes(eq_df: pd.DataFrame):
 class LiveTracking(commands.Cog):
     def __init__(self, client):
         self.client = client
+        init_sqlite()
+        migrate_pickle_data_if_needed()
         self.guild_prefs = get_guild_prefs()
         self.eq_notify_db = get_eq_notify_db()
         self.eq_db = get_eq_db()
@@ -288,6 +489,8 @@ class LiveTracking(commands.Cog):
                 continue
             self.eq_notify_db[str(guild.id)] = {}
 
+        save_guild_prefs_to_sqlite(self.guild_prefs)
+        save_eq_notify_db_to_sqlite(self.eq_notify_db)
         self.poll_quakes.start()
 
 
@@ -482,13 +685,8 @@ class LiveTracking(commands.Cog):
 
                 end_time = time.perf_counter()
 
-                # Save the earthquake data to a binary file, Pickle it!
-                with open(EQ_DB_PATH, "wb") as f:
-                    pickle.dump(self.eq_db, f)
-
-                # Save the eq_eb object to a binary file, Pickle it!
-                with open(EQ_NOTIFY_DB_PATH, "wb") as f:
-                    pickle.dump(self.eq_notify_db, f)
+                save_eq_db_to_sqlite(self.eq_db)
+                save_eq_notify_db_to_sqlite(self.eq_notify_db)
                 logging.info("%s function completed. Elapsed %.2f seconds.",
                              colorize("poll_quakes", "blue"),
                              end_time - start_time)
@@ -654,6 +852,7 @@ class LiveTracking(commands.Cog):
             case _:
                 await ctx.send("That is not a valid emoji.")
 
+        save_guild_prefs_to_sqlite(self.guild_prefs)
         await msg.delete()
 
 
