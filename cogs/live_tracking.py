@@ -9,6 +9,7 @@ import os
 import sqlite3
 import csv
 import io
+import re
 
 from colorlog.escape_codes import escape_codes as c
 from discord.ext import tasks, commands
@@ -17,6 +18,10 @@ import plotly.graph_objects as go
 import pandas as pd
 import discord
 import aiohttp
+try:
+    import pycountry
+except ImportError:  # pragma: no cover - optional dependency in local dev
+    pycountry = None
 
 logger = logging.getLogger("discord")
 
@@ -73,9 +78,100 @@ ISLAND_REGION_KEYWORDS = [
     "beaufort sea",
 ]
 
+US_STATE_ABBREV_TO_NAME = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+US_STATE_NAME_TO_ABBREV = {
+    name.lower(): code for code, name in US_STATE_ABBREV_TO_NAME.items()
+}
+US_STATE_NAME_PATTERNS = {
+    code: re.compile(rf"\b{re.escape(name.lower())}\b")
+    for code, name in US_STATE_ABBREV_TO_NAME.items()
+}
+COUNTRY_ALIAS_TO_CANONICAL = {
+    "us": "United States",
+    "u s": "United States",
+    "u s a": "United States",
+    "usa": "United States",
+    "united states of america": "United States",
+    "uk": "United Kingdom",
+    "u k": "United Kingdom",
+    "russia": "Russian Federation",
+    "south korea": "Korea, Republic of",
+    "north korea": "Korea, Democratic People's Republic of",
+    "iran": "Iran, Islamic Republic of",
+    "venezuela": "Venezuela, Bolivarian Republic of",
+    "syria": "Syrian Arab Republic",
+    "laos": "Lao People's Democratic Republic",
+    "moldova": "Moldova, Republic of",
+    "czech republic": "Czechia",
+    "bolivia": "Bolivia, Plurinational State of",
+    "tanzania": "Tanzania, United Republic of",
+}
+AMBIGUOUS_COUNTRY_NAMES = {"Georgia"}
+
 
 def get_default_guild_prefs():
     return {"MinMagnitude": 3, "UpdateFrequency": 0, "UpdateChannelId": 0, "PlotStyle": 0}
+
+
+def get_default_user_pref():
+    return {
+        "MagnitudeMentionEnabled": False,
+        "MagnitudeThreshold": None,
+        "States": set(),
+        "Countries": set(),
+    }
 
 
 def get_map_style_option(plot_style_idx: int):
@@ -99,9 +195,133 @@ def ensure_data_dir():
     os.makedirs("data", exist_ok=True)
 
 
+def _normalize_geo_text(value: str):
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(value).lower())
+    return " ".join(normalized.split())
+
+
+def _build_country_lookups():
+    country_name_to_canonical = {}
+    canonical_names = set()
+
+    if pycountry is not None:
+        for country in pycountry.countries:
+            canonical_name = country.name
+            canonical_names.add(canonical_name)
+
+            for attr_name in ("name", "official_name", "common_name"):
+                attr_value = getattr(country, attr_name, None)
+                if attr_value:
+                    country_name_to_canonical[_normalize_geo_text(attr_value)] = canonical_name
+
+    for alias, canonical_name in COUNTRY_ALIAS_TO_CANONICAL.items():
+        country_name_to_canonical[_normalize_geo_text(alias)] = canonical_name
+        canonical_names.add(canonical_name)
+
+    country_patterns = {
+        canonical_name: re.compile(rf"\b{re.escape(canonical_name.lower())}\b")
+        for canonical_name in canonical_names
+    }
+    return country_name_to_canonical, country_patterns
+
+
+COUNTRY_NAME_TO_CANONICAL, COUNTRY_PATTERNS = _build_country_lookups()
+
+
+def normalize_state_code(state_input: str):
+    normalized = str(state_input).strip()
+    if not normalized:
+        return None
+
+    upper = normalized.upper()
+    if upper in US_STATE_ABBREV_TO_NAME:
+        return upper
+
+    name_key = normalized.lower()
+    name_key = re.sub(r"[^a-z\s]", "", name_key)
+    name_key = " ".join(name_key.split())
+    return US_STATE_NAME_TO_ABBREV.get(name_key)
+
+
+def infer_us_state_codes_from_place(place: str):
+    if not place:
+        return set()
+
+    state_codes = set()
+    upper_place = str(place).upper()
+
+    for segment in upper_place.split(","):
+        token = segment.strip().split(" ")[0].strip(".")
+        if len(token) == 2 and token in US_STATE_ABBREV_TO_NAME:
+            state_codes.add(token)
+
+    place_lower = str(place).lower()
+    for state_code, state_pattern in US_STATE_NAME_PATTERNS.items():
+        if state_pattern.search(place_lower):
+            state_codes.add(state_code)
+
+    return state_codes
+
+
+def normalize_country_name(country_input: str):
+    normalized = _normalize_geo_text(country_input)
+    return COUNTRY_NAME_TO_CANONICAL.get(normalized)
+
+
+def infer_country_names_from_place(place: str, us_state_codes: set[str] | None = None):
+    if not place:
+        return set()
+
+    countries = set()
+    place_lower = str(place).lower()
+
+    for segment in str(place).split(","):
+        normalized_segment = _normalize_geo_text(segment)
+        if normalized_segment in COUNTRY_NAME_TO_CANONICAL:
+            countries.add(COUNTRY_NAME_TO_CANONICAL[normalized_segment])
+
+    for canonical_name, country_pattern in COUNTRY_PATTERNS.items():
+        if country_pattern.search(place_lower):
+            countries.add(canonical_name)
+
+    has_us_signals = bool(us_state_codes) or bool(
+        re.search(r"\bunited states\b|\busa\b|\bu\.s\.a\.?\b|\b us\b", place_lower)
+    )
+    if has_us_signals:
+        countries.difference_update(AMBIGUOUS_COUNTRY_NAMES)
+
+    return countries
+
+
+def build_mention_chunks(user_ids: list[str], prefix: str = "Personal alerts: "):
+    if not user_ids:
+        return []
+
+    chunks = []
+    current = prefix
+
+    for user_id in user_ids:
+        mention = f"<@{user_id}>"
+        candidate = mention if current == prefix else f" {mention}"
+
+        if len(current) + len(candidate) > 2000:
+            chunks.append(current)
+            current = prefix + mention
+            continue
+
+        current += candidate
+
+    if current != prefix:
+        chunks.append(current)
+
+    return chunks
+
+
 def get_sqlite_conn():
     ensure_data_dir()
-    return sqlite3.connect(SQLITE_DB_PATH)
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def init_sqlite():
@@ -143,6 +363,61 @@ def init_sqlite():
                 longitude REAL,
                 significance INTEGER
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_alert_prefs (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                magnitude_mention_enabled INTEGER NOT NULL DEFAULT 0,
+                magnitude_threshold REAL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_state_alerts (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                state_code TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, state_code),
+                FOREIGN KEY (guild_id, user_id)
+                    REFERENCES user_alert_prefs(guild_id, user_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_country_alerts (
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                country_name TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, country_name),
+                FOREIGN KEY (guild_id, user_id)
+                    REFERENCES user_alert_prefs(guild_id, user_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_alert_prefs_guild
+            ON user_alert_prefs (guild_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_state_alerts_guild_state
+            ON user_state_alerts (guild_id, state_code)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_country_alerts_guild_country
+            ON user_country_alerts (guild_id, country_name)
             """
         )
         conn.commit()
@@ -239,6 +514,144 @@ def save_eq_notify_db_to_sqlite(eq_notify_db: dict):
         conn.commit()
 
 
+def _ensure_user_pref_row_sqlite(conn, guild_id: str, user_id: str):
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO user_alert_prefs (
+            guild_id, user_id, magnitude_mention_enabled, magnitude_threshold
+        ) VALUES (?, ?, 0, NULL)
+        """,
+        (guild_id, user_id),
+    )
+
+
+def save_user_prefs_to_sqlite(user_prefs: dict):
+    """Save in-memory user prefs structure to sqlite (full replace)."""
+    init_sqlite()
+    pref_rows = []
+    state_rows = []
+    country_rows = []
+
+    for guild_id, guild_users in user_prefs.items():
+        for user_id, prefs in guild_users.items():
+            pref_rows.append(
+                (
+                    guild_id,
+                    user_id,
+                    int(bool(prefs.get("MagnitudeMentionEnabled", False))),
+                    prefs.get("MagnitudeThreshold"),
+                )
+            )
+            for state_code in sorted(prefs.get("States", set())):
+                state_rows.append((guild_id, user_id, state_code))
+            for country_name in sorted(prefs.get("Countries", set())):
+                country_rows.append((guild_id, user_id, country_name))
+
+    with get_sqlite_conn() as conn:
+        conn.execute("DELETE FROM user_state_alerts")
+        conn.execute("DELETE FROM user_country_alerts")
+        conn.execute("DELETE FROM user_alert_prefs")
+        if pref_rows:
+            conn.executemany(
+                """
+                INSERT INTO user_alert_prefs (
+                    guild_id, user_id, magnitude_mention_enabled, magnitude_threshold
+                ) VALUES (?, ?, ?, ?)
+                """,
+                pref_rows,
+            )
+        if state_rows:
+            conn.executemany(
+                """
+                INSERT INTO user_state_alerts (
+                    guild_id, user_id, state_code
+                ) VALUES (?, ?, ?)
+                """,
+                state_rows,
+            )
+        if country_rows:
+            conn.executemany(
+                """
+                INSERT INTO user_country_alerts (
+                    guild_id, user_id, country_name
+                ) VALUES (?, ?, ?)
+                """,
+                country_rows,
+            )
+        conn.commit()
+
+
+def upsert_user_magnitude_pref_to_sqlite(guild_id: str, user_id: str, enabled: bool, threshold: float | None):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        _ensure_user_pref_row_sqlite(conn, guild_id, user_id)
+        conn.execute(
+            """
+            UPDATE user_alert_prefs
+            SET magnitude_mention_enabled = ?, magnitude_threshold = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (int(bool(enabled)), threshold, guild_id, user_id),
+        )
+        conn.commit()
+
+
+def add_user_state_alert_to_sqlite(guild_id: str, user_id: str, state_code: str):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        _ensure_user_pref_row_sqlite(conn, guild_id, user_id)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO user_state_alerts (
+                guild_id, user_id, state_code
+            ) VALUES (?, ?, ?)
+            """,
+            (guild_id, user_id, state_code),
+        )
+        conn.commit()
+
+
+def remove_user_state_alert_from_sqlite(guild_id: str, user_id: str, state_code: str):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            DELETE FROM user_state_alerts
+            WHERE guild_id = ? AND user_id = ? AND state_code = ?
+            """,
+            (guild_id, user_id, state_code),
+        )
+        conn.commit()
+
+
+def add_user_country_alert_to_sqlite(guild_id: str, user_id: str, country_name: str):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        _ensure_user_pref_row_sqlite(conn, guild_id, user_id)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO user_country_alerts (
+                guild_id, user_id, country_name
+            ) VALUES (?, ?, ?)
+            """,
+            (guild_id, user_id, country_name),
+        )
+        conn.commit()
+
+
+def remove_user_country_alert_from_sqlite(guild_id: str, user_id: str, country_name: str):
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        conn.execute(
+            """
+            DELETE FROM user_country_alerts
+            WHERE guild_id = ? AND user_id = ? AND country_name = ?
+            """,
+            (guild_id, user_id, country_name),
+        )
+        conn.commit()
+
+
 def get_eq_db():
     """Load earthquakes from sqlite and return in legacy dict format."""
     init_sqlite()
@@ -305,6 +718,52 @@ def get_eq_notify_db():
     for guild_id, earthquake_id, notified in rows:
         eq_notify_db.setdefault(guild_id, {})[earthquake_id] = bool(notified)
     return eq_notify_db
+
+
+def get_user_prefs():
+    """Load user alert preferences from sqlite to nested dict keyed by guild_id then user_id."""
+    init_sqlite()
+    with get_sqlite_conn() as conn:
+        pref_rows = conn.execute(
+            """
+            SELECT guild_id, user_id, magnitude_mention_enabled, magnitude_threshold
+            FROM user_alert_prefs
+            """
+        ).fetchall()
+        state_rows = conn.execute(
+            """
+            SELECT guild_id, user_id, state_code
+            FROM user_state_alerts
+            """
+        ).fetchall()
+        country_rows = conn.execute(
+            """
+            SELECT guild_id, user_id, country_name
+            FROM user_country_alerts
+            """
+        ).fetchall()
+
+    user_prefs = {}
+    for guild_id, user_id, magnitude_mention_enabled, magnitude_threshold in pref_rows:
+        guild_prefs = user_prefs.setdefault(guild_id, {})
+        guild_prefs[user_id] = {
+            "MagnitudeMentionEnabled": bool(magnitude_mention_enabled),
+            "MagnitudeThreshold": magnitude_threshold,
+            "States": set(),
+            "Countries": set(),
+        }
+
+    for guild_id, user_id, state_code in state_rows:
+        guild_prefs = user_prefs.setdefault(guild_id, {})
+        user_pref = guild_prefs.setdefault(user_id, get_default_user_pref())
+        user_pref["States"].add(state_code)
+
+    for guild_id, user_id, country_name in country_rows:
+        guild_prefs = user_prefs.setdefault(guild_id, {})
+        user_pref = guild_prefs.setdefault(user_id, get_default_user_pref())
+        user_pref["Countries"].add(country_name)
+
+    return user_prefs
 
 
 def migrate_pickle_data_if_needed():
@@ -420,6 +879,27 @@ def build_earthquake_csv_parts(rows: list[tuple], max_bytes: int = DISCORD_FILE_
         parts.append({"bytes": bytes(current_bytes), "row_count": current_rows})
 
     return parts
+
+
+def earthquake_passes_guild_magnitude_filter(eq_data: dict, min_magnitude_setting: int):
+    magnitude = eq_data.get("magnitude")
+    if magnitude is None:
+        return False
+
+    match min_magnitude_setting:
+        case 0:
+            return True
+        case 1:
+            return magnitude >= 1.0
+        case 2:
+            return magnitude >= 2.5
+        case 3:
+            return magnitude >= 4.5
+        case 4:
+            # Significant-only mode is still not wired to USGS significance rules yet.
+            return False
+        case _:
+            return False
 
 
 def load_eq_db_to_df():
@@ -602,12 +1082,84 @@ class LiveTracking(commands.Cog):
         migrate_pickle_data_if_needed()
         self.guild_prefs = get_guild_prefs()
         self.eq_notify_db = get_eq_notify_db()
+        self.user_prefs = get_user_prefs()
         self.eq_db = get_eq_db()
         self.client.loop.create_task(self._initialize())
 
     def _ensure_guild_pref(self, guild_id: str):
         if not self.guild_prefs.get(guild_id):
             self.guild_prefs[guild_id] = get_default_guild_prefs()
+
+    def _ensure_user_pref(self, guild_id: str, user_id: str):
+        guild_user_prefs = self.user_prefs.setdefault(guild_id, {})
+        if not guild_user_prefs.get(user_id):
+            guild_user_prefs[user_id] = get_default_user_pref()
+        return guild_user_prefs[user_id]
+
+    def _set_user_magnitude_alert(self, guild_id: str, user_id: str, threshold: float):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["MagnitudeMentionEnabled"] = True
+        user_pref["MagnitudeThreshold"] = threshold
+        upsert_user_magnitude_pref_to_sqlite(guild_id, user_id, True, threshold)
+
+    def _disable_user_magnitude_alert(self, guild_id: str, user_id: str):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["MagnitudeMentionEnabled"] = False
+        user_pref["MagnitudeThreshold"] = None
+        upsert_user_magnitude_pref_to_sqlite(guild_id, user_id, False, None)
+
+    def _add_user_state_alert(self, guild_id: str, user_id: str, state_code: str):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["States"].add(state_code)
+        add_user_state_alert_to_sqlite(guild_id, user_id, state_code)
+
+    def _remove_user_state_alert(self, guild_id: str, user_id: str, state_code: str):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["States"].discard(state_code)
+        remove_user_state_alert_from_sqlite(guild_id, user_id, state_code)
+
+    def _add_user_country_alert(self, guild_id: str, user_id: str, country_name: str):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["Countries"].add(country_name)
+        add_user_country_alert_to_sqlite(guild_id, user_id, country_name)
+
+    def _remove_user_country_alert(self, guild_id: str, user_id: str, country_name: str):
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        user_pref["Countries"].discard(country_name)
+        remove_user_country_alert_from_sqlite(guild_id, user_id, country_name)
+
+    def _get_matching_user_ids(self, guild: discord.Guild, eq_data: dict):
+        guild_user_prefs = self.user_prefs.get(str(guild.id), {})
+        if not guild_user_prefs:
+            return []
+
+        eq_magnitude = eq_data.get("magnitude")
+        eq_states = infer_us_state_codes_from_place(eq_data.get("place", ""))
+        eq_countries = infer_country_names_from_place(eq_data.get("place", ""), eq_states)
+        matching_user_ids = set()
+
+        for user_id, user_pref in guild_user_prefs.items():
+            matches = False
+
+            if user_pref.get("MagnitudeMentionEnabled"):
+                threshold = user_pref.get("MagnitudeThreshold")
+                if threshold is not None and eq_magnitude is not None and eq_magnitude >= threshold:
+                    matches = True
+
+            user_states = user_pref.get("States", set())
+            if user_states and eq_states and user_states.intersection(eq_states):
+                matches = True
+
+            user_countries = user_pref.get("Countries", set())
+            if user_countries and eq_countries and user_countries.intersection(eq_countries):
+                matches = True
+
+            if not matches:
+                continue
+
+            matching_user_ids.add(user_id)
+
+        return sorted(matching_user_ids, key=int)
 
 
     def cog_unload(self):
@@ -664,6 +1216,9 @@ class LiveTracking(commands.Cog):
         if not self.eq_notify_db.get(guild_id):
             self.eq_notify_db[guild_id] = {}
         plot_style = self.guild_prefs[guild_id].get("PlotStyle", 0)
+        channel = get(guild.text_channels, name="quake-updates")
+        if not channel:
+            return
 
         async def send_alert(eq_data: dict):
             image_path = f"eq_plot_{guild_id}_{sanitize_filename(eq_data['earthquake_id'])}.png"
@@ -672,8 +1227,12 @@ class LiveTracking(commands.Cog):
                 plot_style=plot_style,
                 image_path=image_path,
             )
+            mention_chunks = build_mention_chunks(self._get_matching_user_ids(guild, eq_data))
+            first_message_mentions = mention_chunks[0] if mention_chunks else None
             try:
-                await channel.send(embed=eq_embed, file=img_file)
+                await channel.send(content=first_message_mentions, embed=eq_embed, file=img_file)
+                for extra_chunk in mention_chunks[1:]:
+                    await channel.send(extra_chunk)
             finally:
                 if os.path.exists(image_path):
                     os.remove(image_path)
@@ -685,44 +1244,31 @@ class LiveTracking(commands.Cog):
             if self.eq_notify_db[guild_id].get(eq_data["earthquake_id"]):
                 continue
 
-            channel = get(guild.text_channels, name="quake-updates")
-            if not channel:
-                return
+            if earthquake_passes_guild_magnitude_filter(
+                eq_data,
+                self.guild_prefs[guild_id]["MinMagnitude"],
+            ):
+                await send_alert(eq_data)
+                continue
 
-            # Filter the earthquake by guild preferred reporting magnitude
-            match self.guild_prefs[guild_id]["MinMagnitude"]:
-                case 0:
-                    await send_alert(eq_data)
-                case 1:
-                    if eq_data["magnitude"] >= 1.0:
-                        await send_alert(eq_data)
-                    else:
-                        logging.info(
-                            f"Magnitude {eq_data['magnitude']} is too low (<1.0)"
-                            f" skipping message for guild: %s",
-                            guild,)
-                case 2:
-                    if eq_data["magnitude"] >= 2.5:
-                        await send_alert(eq_data)
-                    else:
-                        logging.info(
-                            f"Magnitude {eq_data['magnitude']} is too low (<2.5)"
-                            f" skipping message for guild: %s",
-                            guild)
-                case 3:
-                    # User selected option 3: (4.5 or larger)
-                    if eq_data["magnitude"] >= 4.5:
-                        await send_alert(eq_data)
-                    else:
-                        logging.info(
-                            f"Magnitude {eq_data['magnitude']} is too low (<4.5)"
-                            f" skipping message for guild: %s",
-                            guild)
-                case 4:
-                    #TODO Configure this option, find what classifies as significant.
-                    logging.info(
-                        "Significant only quakes selected,"
-                        " but not configured(how to parse these from the hourly all eq feed?)")
+            if self.guild_prefs[guild_id]["MinMagnitude"] == 4:
+                logging.info(
+                    "Significant only quakes selected,"
+                    " but not configured(how to parse these from the hourly all eq feed?)"
+                )
+                continue
+
+            threshold_label = {
+                1: "1.0",
+                2: "2.5",
+                3: "4.5",
+            }.get(self.guild_prefs[guild_id]["MinMagnitude"], "unknown")
+            logging.info(
+                "Magnitude %s is too low (<%s), skipping message for guild: %s",
+                eq_data.get("magnitude"),
+                threshold_label,
+                guild,
+            )
 
 
     async def get_earthquake_data(self, feature_obj: dict):
@@ -1012,6 +1558,192 @@ class LiveTracking(commands.Cog):
                 ),
                 file=csv_file,
             )
+
+    @commands.hybrid_group(name="alert-me", aliases=["alertme"], invoke_without_command=True)
+    async def alert_me(self, ctx: commands.Context):
+        """Manage personal earthquake alerts for this guild."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        if ctx.invoked_subcommand is not None:
+            return
+
+        await ctx.send(
+            "Use one of these subcommands:\n"
+            "/alert-me magnitude <threshold>\n"
+            "/alert-me disable-magnitude\n"
+            "/alert-me add-state <state>\n"
+            "/alert-me remove-state <state>\n"
+            "/alert-me add-country <country>\n"
+            "/alert-me remove-country <country>\n"
+            "/my-alerts"
+        )
+
+    @alert_me.command(name="magnitude")
+    async def alert_me_magnitude(self, ctx: commands.Context, threshold: float):
+        """Enable personal mention alerts for earthquakes above a magnitude threshold."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        if threshold < 0 or threshold > 10:
+            await ctx.send("Magnitude threshold must be between 0.0 and 10.0.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        self._set_user_magnitude_alert(guild_id, user_id, threshold)
+        await ctx.send(
+            f"Personal magnitude mentions enabled for <@{user_id}> at M{threshold:.1f}+ in this server."
+        )
+
+    @alert_me.command(name="disable-magnitude")
+    async def alert_me_disable_magnitude(self, ctx: commands.Context):
+        """Disable personal magnitude mention alerts."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        self._disable_user_magnitude_alert(guild_id, user_id)
+        await ctx.send("Personal magnitude mention alerts are now disabled.")
+
+    @alert_me.command(name="add-state")
+    async def alert_me_add_state(self, ctx: commands.Context, *, state: str):
+        """Subscribe to personal alerts for a US state (abbr or full name)."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        state_code = normalize_state_code(state)
+        if state_code is None:
+            await ctx.send(
+                "Invalid US state. Use a 2-letter code like `OH` or full name like `Ohio`."
+            )
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        if state_code in user_pref["States"]:
+            await ctx.send(
+                f"You are already subscribed to {state_code} ({US_STATE_ABBREV_TO_NAME[state_code]})."
+            )
+            return
+
+        self._add_user_state_alert(guild_id, user_id, state_code)
+        await ctx.send(
+            f"Added personal state alert for {state_code} ({US_STATE_ABBREV_TO_NAME[state_code]})."
+        )
+
+    @alert_me.command(name="remove-state")
+    async def alert_me_remove_state(self, ctx: commands.Context, *, state: str):
+        """Unsubscribe from personal alerts for a US state (abbr or full name)."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        state_code = normalize_state_code(state)
+        if state_code is None:
+            await ctx.send(
+                "Invalid US state. Use a 2-letter code like `OH` or full name like `Ohio`."
+            )
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        if state_code not in user_pref["States"]:
+            await ctx.send(
+                f"You do not have a state alert configured for {state_code} ({US_STATE_ABBREV_TO_NAME[state_code]})."
+            )
+            return
+
+        self._remove_user_state_alert(guild_id, user_id, state_code)
+        await ctx.send(
+            f"Removed personal state alert for {state_code} ({US_STATE_ABBREV_TO_NAME[state_code]})."
+        )
+
+    @alert_me.command(name="add-country")
+    async def alert_me_add_country(self, ctx: commands.Context, *, country: str):
+        """Subscribe to personal alerts for a country."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        country_name = normalize_country_name(country)
+        if country_name is None:
+            await ctx.send("Invalid country name. Example: `Iran`, `Chile`, `United States`.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        if country_name in user_pref["Countries"]:
+            await ctx.send(f"You are already subscribed to country alerts for {country_name}.")
+            return
+
+        self._add_user_country_alert(guild_id, user_id, country_name)
+        await ctx.send(f"Added personal country alert for {country_name}.")
+
+    @alert_me.command(name="remove-country")
+    async def alert_me_remove_country(self, ctx: commands.Context, *, country: str):
+        """Unsubscribe from personal alerts for a country."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        country_name = normalize_country_name(country)
+        if country_name is None:
+            await ctx.send("Invalid country name. Example: `Iran`, `Chile`, `United States`.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+        if country_name not in user_pref["Countries"]:
+            await ctx.send(f"You do not have a country alert configured for {country_name}.")
+            return
+
+        self._remove_user_country_alert(guild_id, user_id, country_name)
+        await ctx.send(f"Removed personal country alert for {country_name}.")
+
+    @commands.hybrid_command(name="my-alerts")
+    async def my_alerts(self, ctx: commands.Context):
+        """List your personal alert settings for this guild."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        user_id = str(ctx.author.id)
+        user_pref = self._ensure_user_pref(guild_id, user_id)
+
+        if user_pref["MagnitudeMentionEnabled"] and user_pref["MagnitudeThreshold"] is not None:
+            magnitude_text = f"enabled at M{user_pref['MagnitudeThreshold']:.1f}+"
+        else:
+            magnitude_text = "disabled"
+
+        state_codes = sorted(user_pref["States"])
+        if state_codes:
+            state_text = ", ".join(
+                f"{state_code} ({US_STATE_ABBREV_TO_NAME[state_code]})"
+                for state_code in state_codes
+            )
+        else:
+            state_text = "none"
+
+        country_names = sorted(user_pref["Countries"])
+        country_text = ", ".join(country_names) if country_names else "none"
+
+        await ctx.send(
+            f"Personal earthquake alerts for <@{user_id}> in **{ctx.guild.name}**\n"
+            f"- Magnitude mentions: {magnitude_text}\n"
+            f"- State subscriptions: {state_text}\n"
+            f"- Country subscriptions: {country_text}\n"
+            "- State/country matching is inferred from USGS `place` text."
+        )
 
     @commands.hybrid_command(name="config_map")
     async def config_map(self, ctx: commands.Context):
