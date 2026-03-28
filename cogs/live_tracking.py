@@ -1,6 +1,6 @@
 """Everything related to live tracking is in this cog. The poll_quakes function is the main logic"""
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pickle
 import logging
@@ -23,9 +23,15 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in local dev
     pycountry = None
 
+from cogs.earthquake_sources import (
+    EarthquakeEvent,
+    build_earthquake_sources,
+    fetch_events_from_sources,
+)
+
 logger = logging.getLogger("discord")
 
-LIVE_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
+DEFAULT_EARTHQUAKE_SOURCES = ["usgs", "emsc"]
 
 GUILD_PREFS_PATH = "data/guild_prefs.pkl"
 EQ_NOTIFY_DB_PATH = "data/eq_notify_db.pkl"
@@ -1080,10 +1086,15 @@ class LiveTracking(commands.Cog):
         self.client = client
         init_sqlite()
         migrate_pickle_data_if_needed()
+        self.event_sources = build_earthquake_sources(DEFAULT_EARTHQUAKE_SOURCES)
         self.guild_prefs = get_guild_prefs()
         self.eq_notify_db = get_eq_notify_db()
         self.user_prefs = get_user_prefs()
         self.eq_db = get_eq_db()
+        logger.info(
+            "Configured earthquake sources: %s",
+            ", ".join(source.source for source in self.event_sources),
+        )
         self.client.loop.create_task(self._initialize())
 
     def _ensure_guild_pref(self, guild_id: str):
@@ -1185,32 +1196,77 @@ class LiveTracking(commands.Cog):
         self.poll_quakes.start()
 
 
-    async def save_earthquakes(self, list_of_features: list):
-        """Save all earthquake data from a list of features to the eq_db object and save the obj."""
-        for feature in list_of_features:
-            eq_data = await self.get_earthquake_data(feature)
+    def _register_event_for_all_guilds(self, earthquake_id: str):
+        for guild in self.client.guilds:
+            guild_id = str(guild.id)
+            self.eq_notify_db.setdefault(guild_id, {})
+            self.eq_notify_db[guild_id].setdefault(earthquake_id, False)
+
+    def _pager_icon_for_level(self, pager_alert_level: str | None):
+        match pager_alert_level:
+            case "green":
+                return "🟩"
+            case "yellow":
+                return "🟨"
+            case "orange":
+                return "🟧"
+            case "red":
+                return "🟥"
+            case _:
+                return "-"
+
+    def _format_event_time(self, event_time_utc: datetime | None):
+        if event_time_utc is None:
+            return "unknown"
+        dt = event_time_utc.astimezone(ZoneInfo("America/New_York"))
+        return dt.strftime("%m/%d/%Y - %I:%M %p")
+
+    def _event_to_eq_data(self, event: EarthquakeEvent):
+        depth = "unknown" if event.depth_km is None else str(event.depth_km)
+        return {
+            "pager_lvl_icon": self._pager_icon_for_level(event.pager_alert_level),
+            "place": event.place,
+            "magnitude": event.magnitude,
+            "url": event.url,
+            "time": self._format_event_time(event.event_time_utc),
+            "earthquake_id": event.earthquake_id,
+            "pager_alert_level": event.pager_alert_level,
+            "tsunami_potential": bool(event.tsunami_potential) if event.tsunami_potential is not None else False,
+            "depth": depth,
+            "latitude": event.latitude,
+            "longitude": event.longitude,
+            "significance": event.significance,
+        }
+
+    async def save_earthquakes(self, earthquakes: list[dict]):
+        """Save all earthquake payloads to the eq_db object."""
+        for eq_data in earthquakes:
             eq_id = eq_data.get("earthquake_id")
+            if not eq_id:
+                continue
 
-            if not self.eq_db.get(eq_id):
-                logging.info("||=*=|| Saving Earthquake ||=*=|| %s", eq_data["earthquake_id"])
-                self.eq_db[eq_id] = {
-                                        "pager_lvl_icon": eq_data["pager_lvl_icon"],
-                                        "place": eq_data["place"],
-                                        "magnitude": eq_data["magnitude"],
-                                        "url": eq_data["url"],
-                                        "time": eq_data["time"],
-                                        "earthquake_id": eq_data["earthquake_id"],
-                                        "pager_alert_level": eq_data["pager_alert_level"],
-                                        "tsunami_potential": eq_data["tsunami_potential"],
-                                        "depth": eq_data["depth"],
-                                        "latitude": eq_data["latitude"],
-                                        "longitude": eq_data["longitude"],
-                                        "significance": eq_data["significance"],
-                }
-                logging.info("||=*=|| Earthquake Saved! ||=*=|| ")
+            self._register_event_for_all_guilds(eq_id)
+            if self.eq_db.get(eq_id):
+                continue
 
+            logging.info("||=*=|| Saving Earthquake ||=*=|| %s", eq_id)
+            self.eq_db[eq_id] = {
+                "pager_lvl_icon": eq_data["pager_lvl_icon"],
+                "place": eq_data["place"],
+                "magnitude": eq_data["magnitude"],
+                "url": eq_data["url"],
+                "time": eq_data["time"],
+                "earthquake_id": eq_data["earthquake_id"],
+                "pager_alert_level": eq_data["pager_alert_level"],
+                "tsunami_potential": eq_data["tsunami_potential"],
+                "depth": eq_data["depth"],
+                "latitude": eq_data["latitude"],
+                "longitude": eq_data["longitude"],
+                "significance": eq_data["significance"],
+            }
+            logging.info("||=*=|| Earthquake Saved! ||=*=|| ")
 
-    async def notify_guild(self, features: list, guild: discord.Guild):
+    async def notify_guild(self, earthquakes: list[dict], guild: discord.Guild):
         guild_id = str(guild.id)
         self._ensure_guild_pref(guild_id)
         if not self.eq_notify_db.get(guild_id):
@@ -1238,9 +1294,7 @@ class LiveTracking(commands.Cog):
                     os.remove(image_path)
             self.eq_notify_db[guild_id][eq_data["earthquake_id"]] = True
 
-        for feature in features:
-            eq_data = await self.get_earthquake_data(feature)
-
+        for eq_data in earthquakes:
             if self.eq_notify_db[guild_id].get(eq_data["earthquake_id"]):
                 continue
 
@@ -1271,73 +1325,6 @@ class LiveTracking(commands.Cog):
             )
 
 
-    async def get_earthquake_data(self, feature_obj: dict):
-        """Unpack the dictionary and format all values, return a formatted dict"""
-        pager_alert_level = feature_obj.get("properties")["alert"]
-
-        # Colored Square | Info - https://earthquake.usgs.gov/data/pager/onepager.php
-        match pager_alert_level:
-            case "green":
-                pager_lvl_icon = "🟩"
-            case "yellow":
-                pager_lvl_icon = "🟨"
-            case "orange":
-                pager_lvl_icon = "🟧"
-            case "red":
-                pager_lvl_icon = "🟥"
-            case _:
-                pager_lvl_icon = "-"
-
-        place = feature_obj.get("properties")["place"]
-        mag = feature_obj.get("properties")["mag"]
-        url = feature_obj.get("properties")["url"]
-        time_ms = feature_obj.get("properties")["time"]
-        time_seconds = time_ms / 1000
-        utc_dt = datetime.fromtimestamp(time_seconds,tz=timezone.utc)
-        dt = utc_dt.astimezone(ZoneInfo("America/New_York"))
-        formatted_dt = dt.strftime("%m/%d/%Y - %I:%M %p")
-        tsunami_potential = feature_obj.get("properties")["tsunami"]
-        depth = feature_obj.get("properties").get("depth")
-        longitude = feature_obj.get("geometry").get("coordinates")[0]
-        latitude = feature_obj.get("geometry").get("coordinates")[1]
-        significance = feature_obj.get("properties").get("sig")
-
-        if not depth:
-            depth = "unknown"
-        else:
-            depth = str(depth)
-
-        earthquake_id = (str(mag) + "-"
-                         + str(feature_obj.get("properties").get("code")) + "-"
-                         + str(feature_obj.get("properties").get("time")))
-
-        # Initialize eq_data.guild earthquake records
-        for guild in self.client.guilds:
-            if self.eq_notify_db.get(str(guild.id)):
-                if self.eq_notify_db.get(str(guild.id)).get(earthquake_id):
-                    continue
-                else:
-                    # Register that we see the earthquake and set value to false
-                    # This false value is acting as the answer to a question, has this guild.id
-                    # reported on this earthquake
-                    self.eq_notify_db[str(guild.id)][earthquake_id] = False
-
-        return {
-            "pager_lvl_icon": pager_lvl_icon,
-            "place": place,
-            "magnitude": mag,
-            "url": url,
-            "time": formatted_dt,
-            "earthquake_id": earthquake_id,
-            "pager_alert_level": pager_alert_level,
-            "tsunami_potential": tsunami_potential,
-            "depth": depth,
-            "latitude": latitude,
-            "longitude": longitude,
-            "significance": significance,
-        }
-
-
     @tasks.loop(seconds=60.0)
     async def poll_quakes(self):
         """Every 10 minutes, poll the api for new earthquakes. When a new quake is detected,
@@ -1355,34 +1342,29 @@ class LiveTracking(commands.Cog):
 
         await self.client.wait_until_ready()
         async with aiohttp.ClientSession() as session:
-            async with session.get(LIVE_URL) as resp:
-                data = await resp.json()
-                logging.debug(f"Request: %s", LIVE_URL)
-                logging.debug(f"Response StatusCode: %s", resp.status)
-                if resp.status != 200:
-                    logging.error("Error getting latest data. Response text: %s", resp.text())
-                    return
+            source_events = await fetch_events_from_sources(session, self.event_sources)
 
-                feature_list = data.get("features", [])
-                if len(feature_list) == 0:
-                    logging.info("No earthquakes detected in the last hour.")
-                    return
+        if len(source_events) == 0:
+            logging.info("No earthquakes detected from configured sources.")
+            return
 
-                # Save the earthquakes once after the HTTP pull
-                await self.save_earthquakes(feature_list)
+        earthquake_payloads = [self._event_to_eq_data(event) for event in source_events]
 
-                for guild in self.client.guilds:
-                    logging.info("Attempting to notify guild: %s", guild.name)
-                    await self.notify_guild(feature_list, guild)
-                    logging.info("Completed notifying guild: %s", guild.name)
+        # Save earthquakes once after fetching all configured sources.
+        await self.save_earthquakes(earthquake_payloads)
 
-                end_time = time.perf_counter()
+        for guild in self.client.guilds:
+            logging.info("Attempting to notify guild: %s", guild.name)
+            await self.notify_guild(earthquake_payloads, guild)
+            logging.info("Completed notifying guild: %s", guild.name)
 
-                save_eq_db_to_sqlite(self.eq_db)
-                save_eq_notify_db_to_sqlite(self.eq_notify_db)
-                logging.info("%s function completed. Elapsed %.2f seconds.",
-                             colorize("poll_quakes", "blue"),
-                             end_time - start_time)
+        end_time = time.perf_counter()
+
+        save_eq_db_to_sqlite(self.eq_db)
+        save_eq_notify_db_to_sqlite(self.eq_notify_db)
+        logging.info("%s function completed. Elapsed %.2f seconds.",
+                     colorize("poll_quakes", "blue"),
+                     end_time - start_time)
 
     @commands.hybrid_command(name="top-10-largest-today",aliases=["top10"])
     async def top10(self, ctx: commands.Context):
