@@ -168,7 +168,13 @@ AMBIGUOUS_COUNTRY_NAMES = {"Georgia"}
 
 
 def get_default_guild_prefs():
-    return {"MinMagnitude": 3, "UpdateFrequency": 0, "UpdateChannelId": 0, "PlotStyle": 0}
+    return {
+        "MinMagnitude": 3,
+        "UpdateFrequency": 0,
+        "UpdateChannelId": 0,
+        "PlotStyle": 0,
+        "PinMagnitude": None,
+    }
 
 
 def get_default_user_pref():
@@ -339,10 +345,16 @@ def init_sqlite():
                 min_magnitude INTEGER NOT NULL DEFAULT 3,
                 update_frequency INTEGER NOT NULL DEFAULT 0,
                 update_channel_id INTEGER NOT NULL DEFAULT 0,
-                plot_style INTEGER NOT NULL DEFAULT 0
+                plot_style INTEGER NOT NULL DEFAULT 0,
+                pin_magnitude REAL
             )
             """
         )
+        guild_pref_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(guild_prefs)").fetchall()
+        }
+        if "pin_magnitude" not in guild_pref_columns:
+            conn.execute("ALTER TABLE guild_prefs ADD COLUMN pin_magnitude REAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS eq_notify (
@@ -478,13 +490,14 @@ def save_guild_prefs_to_sqlite(guild_prefs: dict):
         conn.executemany(
             """
             INSERT INTO guild_prefs (
-                guild_id, min_magnitude, update_frequency, update_channel_id, plot_style
-            ) VALUES (?, ?, ?, ?, ?)
+                guild_id, min_magnitude, update_frequency, update_channel_id, plot_style, pin_magnitude
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 min_magnitude=excluded.min_magnitude,
                 update_frequency=excluded.update_frequency,
                 update_channel_id=excluded.update_channel_id,
-                plot_style=excluded.plot_style
+                plot_style=excluded.plot_style,
+                pin_magnitude=excluded.pin_magnitude
             """,
             [
                 (
@@ -493,6 +506,7 @@ def save_guild_prefs_to_sqlite(guild_prefs: dict):
                     prefs.get("UpdateFrequency", 0),
                     prefs.get("UpdateChannelId", 0),
                     prefs.get("PlotStyle", 0),
+                    prefs.get("PinMagnitude"),
                 )
                 for guild_id, prefs in guild_prefs.items()
             ],
@@ -694,7 +708,7 @@ def get_guild_prefs():
     with get_sqlite_conn() as conn:
         rows = conn.execute(
             """
-            SELECT guild_id, min_magnitude, update_frequency, update_channel_id, plot_style
+            SELECT guild_id, min_magnitude, update_frequency, update_channel_id, plot_style, pin_magnitude
             FROM guild_prefs
             """
         ).fetchall()
@@ -704,6 +718,7 @@ def get_guild_prefs():
             "UpdateFrequency": row[2],
             "UpdateChannelId": row[3],
             "PlotStyle": row[4],
+            "PinMagnitude": row[5],
         }
         for row in rows
     }
@@ -1098,8 +1113,10 @@ class LiveTracking(commands.Cog):
         self.client.loop.create_task(self._initialize())
 
     def _ensure_guild_pref(self, guild_id: str):
-        if not self.guild_prefs.get(guild_id):
-            self.guild_prefs[guild_id] = get_default_guild_prefs()
+        guild_pref = self.guild_prefs.setdefault(guild_id, get_default_guild_prefs())
+        default_pref = get_default_guild_prefs()
+        for pref_key, pref_value in default_pref.items():
+            guild_pref.setdefault(pref_key, pref_value)
 
     def _ensure_user_pref(self, guild_id: str, user_id: str):
         guild_user_prefs = self.user_prefs.setdefault(guild_id, {})
@@ -1286,9 +1303,37 @@ class LiveTracking(commands.Cog):
             mention_chunks = build_mention_chunks(self._get_matching_user_ids(guild, eq_data))
             first_message_mentions = mention_chunks[0] if mention_chunks else None
             try:
-                await channel.send(content=first_message_mentions, embed=eq_embed, file=img_file)
+                sent_message = await channel.send(
+                    content=first_message_mentions,
+                    embed=eq_embed,
+                    file=img_file,
+                )
                 for extra_chunk in mention_chunks[1:]:
                     await channel.send(extra_chunk)
+                pin_threshold = self.guild_prefs[guild_id].get("PinMagnitude")
+                eq_magnitude = eq_data.get("magnitude")
+                if (
+                    pin_threshold is not None
+                    and eq_magnitude is not None
+                    and float(eq_magnitude) >= float(pin_threshold)
+                ):
+                    try:
+                        await sent_message.pin(
+                            reason=f"Earthquake magnitude {eq_magnitude} meets pin threshold {pin_threshold}"
+                        )
+                    except discord.Forbidden:
+                        logging.warning(
+                            "Missing permission to pin messages in #%s for guild %s.",
+                            channel.name,
+                            guild.name,
+                        )
+                    except discord.HTTPException as err:
+                        logging.warning(
+                            "Failed to pin earthquake alert %s in guild %s: %s",
+                            eq_data.get("earthquake_id"),
+                            guild.name,
+                            err,
+                        )
             finally:
                 if os.path.exists(image_path):
                     os.remove(image_path)
@@ -1426,7 +1471,10 @@ class LiveTracking(commands.Cog):
     async def today(self, ctx: commands.Context):
         """Output a summary of today's earthquakes.
         Plot all earthquakes to a map and send as message."""
-        df =load_eq_db_to_df()
+        if ctx.interaction is not None:
+            await ctx.defer()
+
+        df = load_eq_db_to_df()
         df["time"] = pd.to_datetime(df["time"])
         df["date"] = df["time"].dt.date
         today = datetime.today().date()
@@ -1463,6 +1511,9 @@ class LiveTracking(commands.Cog):
     @commands.hybrid_command(name="maptoday")
     async def maptoday(self, ctx: commands.Context):
         """Plot all earthquakes from today on a flat map and send as message."""
+        if ctx.interaction is not None:
+            await ctx.defer()
+
         df = load_eq_db_to_df()
         df["time"] = pd.to_datetime(df["time"])
         df["date"] = df["time"].dt.date
@@ -1893,6 +1944,25 @@ class LiveTracking(commands.Cog):
 
         save_guild_prefs_to_sqlite(self.guild_prefs)
         await msg.delete()
+
+    @commands.hybrid_command(name="pin-magnitude")
+    async def pin_magnitude(self, ctx: commands.Context, magnitude: float):
+        """Set the minimum earthquake magnitude that triggers pinning alert messages."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        if magnitude < 0:
+            await ctx.send("Please provide a non-negative magnitude.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        self._ensure_guild_pref(guild_id)
+        self.guild_prefs[guild_id]["PinMagnitude"] = float(magnitude)
+        save_guild_prefs_to_sqlite(self.guild_prefs)
+        await ctx.send(
+            f"Earthquake alerts with magnitude **{magnitude:g}+** will now be pinned in their alert channel."
+        )
 
 
 async def setup(bot):
