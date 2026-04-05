@@ -1,1 +1,8 @@
 /discord.log
+.vscode/launch.json
+.codex
+cogs/__pycache__/earthquake_sources.cpython-314.pyc
+.gitignore
+cogs/__pycache__/live_tracking.cpython-314.pyc
+.gitignore
+__pycache__/main.cpython-314.pyc

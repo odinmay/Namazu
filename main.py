@@ -9,6 +9,8 @@ from discord.ext import commands
 import colorlog
 
 VERSION_NUMBER = "v0.13"
+DEV_MODE = True
+DEV_GUILD_ID = 1489786316085526718
 
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")
 
@@ -37,13 +39,19 @@ console_formatter = colorlog.ColoredFormatter(
 # Instantiate the bot object and set options variables
 intents = discord.Intents(messages=True, message_content=True, guilds=True, reactions=True)
 client = commands.Bot(command_prefix=".", intents=intents)
+client.dev_mode = DEV_MODE
+client.dev_guild_id = DEV_GUILD_ID
 
 @client.event
 async def on_ready():
     """Runs when the bot is ready, loads cogs, set presence message, and sync command tree."""
     await client.load_extension('cogs.live_tracking')
     await client.change_presence(activity=discord.Game(name='github.com/odinmay'))
-    await client.tree.sync()
+    if client.dev_mode:
+        await client.tree.sync(guild=discord.Object(id=client.dev_guild_id))
+        logger.info("Dev mode enabled. Command sync limited to guild %s.", client.dev_guild_id)
+    else:
+        await client.tree.sync()
 
 
 if __name__ == '__main__':

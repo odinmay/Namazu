@@ -13,7 +13,6 @@ import re
 
 from colorlog.escape_codes import escape_codes as c
 from discord.ext import tasks, commands
-from discord.utils import get
 import plotly.graph_objects as go
 import pandas as pd
 import discord
@@ -1118,6 +1117,61 @@ class LiveTracking(commands.Cog):
         for pref_key, pref_value in default_pref.items():
             guild_pref.setdefault(pref_key, pref_value)
 
+    def _is_enabled_guild(self, guild: discord.Guild):
+        if not getattr(self.client, "dev_mode", False):
+            return True
+        return guild.id == getattr(self.client, "dev_guild_id", 0)
+
+    def _iter_enabled_guilds(self):
+        if not getattr(self.client, "dev_mode", False):
+            return list(self.client.guilds)
+
+        dev_guild_id = getattr(self.client, "dev_guild_id", 0)
+        dev_guild = self.client.get_guild(dev_guild_id)
+        if dev_guild is None:
+            logging.warning(
+                "Dev mode is enabled, but guild %s is not available to this bot.",
+                dev_guild_id,
+            )
+            return []
+
+        return [dev_guild]
+
+    def _find_text_channel_by_name(self, guild: discord.Guild, channel_name: str):
+        normalized_name = str(channel_name).strip().lstrip("#").casefold()
+        if not normalized_name:
+            return None
+
+        return discord.utils.find(
+            lambda channel: channel.name.casefold() == normalized_name,
+            guild.text_channels,
+        )
+
+    def _get_update_channel(self, guild: discord.Guild):
+        guild_id = str(guild.id)
+        self._ensure_guild_pref(guild_id)
+        configured_channel_id = self.guild_prefs[guild_id].get("UpdateChannelId", 0)
+
+        if configured_channel_id:
+            channel = guild.get_channel(int(configured_channel_id))
+            if isinstance(channel, discord.TextChannel):
+                return channel
+
+            logging.warning(
+                "Configured update channel %s is unavailable in guild %s. Clearing saved channel.",
+                configured_channel_id,
+                guild.name,
+            )
+            self.guild_prefs[guild_id]["UpdateChannelId"] = 0
+            save_guild_prefs_to_sqlite(self.guild_prefs)
+
+        legacy_channel = self._find_text_channel_by_name(guild, "quake-updates")
+        if legacy_channel is not None:
+            self.guild_prefs[guild_id]["UpdateChannelId"] = legacy_channel.id
+            save_guild_prefs_to_sqlite(self.guild_prefs)
+
+        return legacy_channel
+
     def _ensure_user_pref(self, guild_id: str, user_id: str):
         guild_user_prefs = self.user_prefs.setdefault(guild_id, {})
         if not guild_user_prefs.get(user_id):
@@ -1199,11 +1253,11 @@ class LiveTracking(commands.Cog):
         Ensures eq_notify_db and guild_prefs are loaded before starting the polling loop."""
 
         # Create or set guild preferences
-        for guild in self.client.guilds:
+        for guild in self._iter_enabled_guilds():
             self._ensure_guild_pref(str(guild.id))
 
         # Set eq_notify_db guild.id default key object
-        for guild in self.client.guilds:
+        for guild in self._iter_enabled_guilds():
             if self.eq_notify_db.get(str(guild.id)):
                 continue
             self.eq_notify_db[str(guild.id)] = {}
@@ -1214,7 +1268,7 @@ class LiveTracking(commands.Cog):
 
 
     def _register_event_for_all_guilds(self, earthquake_id: str):
-        for guild in self.client.guilds:
+        for guild in self._iter_enabled_guilds():
             guild_id = str(guild.id)
             self.eq_notify_db.setdefault(guild_id, {})
             self.eq_notify_db[guild_id].setdefault(earthquake_id, False)
@@ -1284,12 +1338,15 @@ class LiveTracking(commands.Cog):
             logging.info("||=*=|| Earthquake Saved! ||=*=|| ")
 
     async def notify_guild(self, earthquakes: list[dict], guild: discord.Guild):
+        if not self._is_enabled_guild(guild):
+            return
+
         guild_id = str(guild.id)
         self._ensure_guild_pref(guild_id)
         if not self.eq_notify_db.get(guild_id):
             self.eq_notify_db[guild_id] = {}
         plot_style = self.guild_prefs[guild_id].get("PlotStyle", 0)
-        channel = get(guild.text_channels, name="quake-updates")
+        channel = self._get_update_channel(guild)
         if not channel:
             return
 
@@ -1398,7 +1455,7 @@ class LiveTracking(commands.Cog):
         # Save earthquakes once after fetching all configured sources.
         await self.save_earthquakes(earthquake_payloads)
 
-        for guild in self.client.guilds:
+        for guild in self._iter_enabled_guilds():
             logging.info("Attempting to notify guild: %s", guild.name)
             await self.notify_guild(earthquake_payloads, guild)
             logging.info("Completed notifying guild: %s", guild.name)
@@ -1878,6 +1935,29 @@ class LiveTracking(commands.Cog):
             f"Map style set to {selected_style['label']} (`{selected_style['map_style']}`) "
             "for this server."
         )
+
+    @commands.hybrid_command(name="channel")
+    async def channel(self, ctx: commands.Context, channel_name: str):
+        """Set the text channel used for earthquake updates in this guild."""
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+
+        normalized_name = str(channel_name).strip().lstrip("#")
+        if not normalized_name:
+            await ctx.send("Please provide a text channel name, for example `/channel quake-updates`.")
+            return
+
+        channel = self._find_text_channel_by_name(ctx.guild, normalized_name)
+        if channel is None:
+            await ctx.send(f"I couldn't find a text channel named `#{normalized_name}` in this server.")
+            return
+
+        guild_id = str(ctx.guild.id)
+        self._ensure_guild_pref(guild_id)
+        self.guild_prefs[guild_id]["UpdateChannelId"] = channel.id
+        save_guild_prefs_to_sqlite(self.guild_prefs)
+        await ctx.send(f"Earthquake updates will now be sent to {channel.mention}.")
 
 
     @commands.hybrid_command(name="config")
