@@ -8,8 +8,8 @@ import discord
 from discord.ext import commands
 import colorlog
 
-VERSION_NUMBER = "v0.13"
-DEV_MODE = True
+VERSION_NUMBER = "v1.3"
+DEV_MODE = False
 DEV_GUILD_ID = 1489786316085526718
 
 DISCORD_SECRET = os.getenv("DISCORD_SECRET")

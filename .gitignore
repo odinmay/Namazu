@@ -6,3 +6,4 @@ cogs/__pycache__/earthquake_sources.cpython-314.pyc
 cogs/__pycache__/live_tracking.cpython-314.pyc
 .gitignore
 __pycache__/main.cpython-314.pyc
+__pycache__/namazu_utils.cpython-314.pyc
