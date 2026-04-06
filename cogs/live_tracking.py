@@ -143,6 +143,22 @@ class LiveTracking(commands.Cog):
             guild_user_prefs[user_id] = get_default_user_pref()
         return guild_user_prefs[user_id]
 
+    async def _send_map_style_preview_batches(
+        self,
+        ctx: commands.Context,
+        embeds: list[discord.Embed],
+        files: list[discord.File],
+        batch_size: int = 3,
+    ):
+        """Send map style previews in smaller batches so Discord reliably renders each image."""
+        for batch_start in range(0, len(embeds), batch_size):
+            content = "Map style previews:" if batch_start == 0 else None
+            await ctx.send(
+                content=content,
+                embeds=embeds[batch_start:batch_start + batch_size],
+                files=files[batch_start:batch_start + batch_size],
+            )
+
     def _set_user_magnitude_alert(self, guild_id: str, user_id: str, threshold: float):
         user_pref = self._ensure_user_pref(guild_id, user_id)
         user_pref["MagnitudeMentionEnabled"] = True
@@ -865,7 +881,8 @@ class LiveTracking(commands.Cog):
         )
 
         try:
-            msg = await ctx.send(content=prompt, embeds=embeds, files=files)
+            await self._send_map_style_preview_batches(ctx, embeds, files)
+            msg = await ctx.send(content=prompt)
         finally:
             for path in preview_paths:
                 if os.path.exists(path):
