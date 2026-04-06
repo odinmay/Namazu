@@ -7,6 +7,7 @@ import os
 import pickle
 import re
 import sqlite3
+import textwrap
 import time
 
 from colorlog.escape_codes import escape_codes as c
@@ -987,13 +988,70 @@ def load_eq_db_to_df():
     return df
 
 
+def _build_single_quake_title(mag, place: str):
+    """Build a wrapped Plotly title that stays readable within the 400px export."""
+    magnitude_line = f"Magnitude: {mag}"
+    normalized_place = " ".join(str(place).split())
+    if not normalized_place:
+        return {"text": magnitude_line, "font": {"size": 16}}, 30
+
+    single_line_title = f"{magnitude_line} {normalized_place}"
+    if len(single_line_title) <= 34:
+        return {"text": single_line_title, "font": {"size": 16}}, 30
+
+    place_length = len(normalized_place)
+    if place_length <= 26:
+        wrap_width = 26
+        font_size = 16
+    elif place_length <= 44:
+        wrap_width = 24
+        font_size = 15
+    elif place_length <= 64:
+        wrap_width = 22
+        font_size = 14
+    elif place_length <= 90:
+        wrap_width = 20
+        font_size = 13
+    else:
+        wrap_width = 18
+        font_size = 12
+
+    wrapped_place_lines = textwrap.wrap(
+        normalized_place,
+        width=wrap_width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+    max_lines = 4
+    if len(wrapped_place_lines) > max_lines:
+        kept_lines = wrapped_place_lines[:max_lines]
+        kept_lines[-1] = textwrap.shorten(
+            " ".join(wrapped_place_lines[max_lines - 1:]),
+            width=wrap_width,
+            placeholder="...",
+        )
+        wrapped_place_lines = kept_lines
+        font_size = max(font_size - 1, 11)
+
+    title_lines = [magnitude_line, *wrapped_place_lines]
+    title_margin = 30 + (len(title_lines) - 1) * (font_size + 3)
+    title_config = {
+        "text": "<br>".join(title_lines),
+        "font": {"size": font_size},
+        "x": 0.5,
+        "xanchor": "center",
+        "y": 0.98,
+        "yanchor": "top",
+    }
+    return title_config, title_margin
+
+
 def plot_to_img_with_plotly(long, lat, place, mag, filename="eq_plot.png", plot_style=0):
     """Plot a single earthquake point and save as an image."""
     style, _ = get_map_style_option(plot_style)
     map_zoom = get_single_quake_zoom(place)
-    title_str = "Magnitude: " + str(mag) + " " + place
-    if len(title_str) > 35:
-        title_str = "Magnitude: " + str(mag) + "\n" + place
+    title_config, title_margin = _build_single_quake_title(mag, place)
 
     fig = go.Figure()
     fig.add_trace(
@@ -1015,9 +1073,9 @@ def plot_to_img_with_plotly(long, lat, place, mag, filename="eq_plot.png", plot_
         map_config["layers"] = style["map_layers"]
 
     fig.update_layout(
-        title=title_str,
+        title=title_config,
         font={"color": style["font_color"]},
-        margin={"r": 0, "t": 30, "l": 0, "b": 0},
+        margin={"r": 0, "t": title_margin, "l": 0, "b": 0},
         map=map_config,
         paper_bgcolor=style["paper_bgcolor"],
         plot_bgcolor=style["paper_bgcolor"],
