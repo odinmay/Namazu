@@ -993,57 +993,104 @@ def _build_single_quake_title(mag, place: str):
     magnitude_line = f"Magnitude: {mag}"
     normalized_place = " ".join(str(place).split())
     if not normalized_place:
-        return {"text": magnitude_line, "font": {"size": 16}}, 30
+        return {
+            "text": magnitude_line,
+            "font": {"size": 16},
+            "x": 0.5,
+            "xanchor": "center",
+            "automargin": True,
+        }, 24
 
+    def estimate_line_width(text: str, font_size: int):
+        width_units = 0.0
+        for char in text:
+            if char == " ":
+                width_units += 0.32
+            elif char in ".,:;!|'`":
+                width_units += 0.24
+            elif char in "ilIjtfr()[]":
+                width_units += 0.34
+            elif char in "mwMW@#%&":
+                width_units += 0.90
+            elif char.isupper() or char.isdigit():
+                width_units += 0.62
+            else:
+                width_units += 0.54
+        return width_units * font_size
+
+    def wrap_line_to_width(text: str, font_size: int, max_width_px: float):
+        wrapped_lines = []
+        current_line = ""
+
+        for word in text.split():
+            candidate = word if not current_line else f"{current_line} {word}"
+            if estimate_line_width(candidate, font_size) <= max_width_px:
+                current_line = candidate
+                continue
+
+            if current_line:
+                wrapped_lines.append(current_line)
+                current_line = word
+            else:
+                shortened = textwrap.shorten(text, width=max(len(word) - 1, 8), placeholder="...")
+                wrapped_lines.append(shortened)
+                current_line = ""
+                break
+
+        if current_line:
+            wrapped_lines.append(current_line)
+        return wrapped_lines
+
+    max_title_width_px = 340
+    min_font_size = 10
+    max_font_size = 16
     single_line_title = f"{magnitude_line} {normalized_place}"
-    if len(single_line_title) <= 34:
-        return {"text": single_line_title, "font": {"size": 16}}, 30
 
-    place_length = len(normalized_place)
-    if place_length <= 26:
-        wrap_width = 26
-        font_size = 16
-    elif place_length <= 44:
-        wrap_width = 24
-        font_size = 15
-    elif place_length <= 64:
-        wrap_width = 22
-        font_size = 14
-    elif place_length <= 90:
-        wrap_width = 20
-        font_size = 13
-    else:
-        wrap_width = 18
-        font_size = 12
+    for font_size in range(max_font_size, min_font_size - 1, -1):
+        if estimate_line_width(single_line_title, font_size) <= max_title_width_px:
+            title_config = {
+                "text": single_line_title,
+                "font": {"size": font_size},
+                "x": 0.5,
+                "xanchor": "center",
+                "automargin": True,
+            }
+            return title_config, max(22, 6 + font_size)
 
-    wrapped_place_lines = textwrap.wrap(
-        normalized_place,
-        width=wrap_width,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
+    for font_size in range(max_font_size, min_font_size - 1, -1):
+        wrapped_place_lines = wrap_line_to_width(normalized_place, font_size, max_title_width_px)
+        if len(wrapped_place_lines) <= 2:
+            title_lines = [magnitude_line, *wrapped_place_lines]
+            title_config = {
+                "text": "<br>".join(title_lines),
+                "font": {"size": font_size},
+                "x": 0.5,
+                "xanchor": "center",
+                "automargin": True,
+            }
+            title_margin = max(22, 6 + len(title_lines) * (font_size + 2))
+            return title_config, title_margin
 
-    max_lines = 4
-    if len(wrapped_place_lines) > max_lines:
-        kept_lines = wrapped_place_lines[:max_lines]
-        kept_lines[-1] = textwrap.shorten(
-            " ".join(wrapped_place_lines[max_lines - 1:]),
-            width=wrap_width,
+    wrapped_place_lines = wrap_line_to_width(normalized_place, min_font_size, max_title_width_px)
+    max_place_lines = 3
+    if len(wrapped_place_lines) > max_place_lines:
+        remaining_text = " ".join(wrapped_place_lines[max_place_lines - 1:])
+        wrapped_place_lines = wrapped_place_lines[:max_place_lines]
+        wrapped_place_lines[-1] = textwrap.shorten(
+            remaining_text,
+            width=max(len(wrapped_place_lines[-1]) - 1, 12),
             placeholder="...",
         )
-        wrapped_place_lines = kept_lines
-        font_size = max(font_size - 1, 11)
 
     title_lines = [magnitude_line, *wrapped_place_lines]
-    title_margin = 30 + (len(title_lines) - 1) * (font_size + 3)
     title_config = {
         "text": "<br>".join(title_lines),
-        "font": {"size": font_size},
+        "font": {"size": min_font_size},
         "x": 0.5,
         "xanchor": "center",
-        "y": 0.98,
-        "yanchor": "top",
+        "automargin": True,
     }
+    title_margin = max(22, 6 + len(title_lines) * (min_font_size + 2))
     return title_config, title_margin
 
 
