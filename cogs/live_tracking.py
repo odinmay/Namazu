@@ -1,6 +1,6 @@
 """Everything related to live tracking is in this cog. The poll_quakes function is the main logic"""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 import os
@@ -49,6 +49,10 @@ from namazu_utils import (
     normalize_country_name,
     normalize_state_code,
     plot_daily_earthquakes,
+    plot_earthquake_activity_timeline,
+    plot_earthquake_magnitude_distribution,
+    plot_earthquake_overview_map,
+    plot_earthquake_top_regions,
     plot_to_img_with_plotly,
     remove_user_country_alert_from_sqlite,
     remove_user_state_alert_from_sqlite,
@@ -143,18 +147,18 @@ class LiveTracking(commands.Cog):
             guild_user_prefs[user_id] = get_default_user_pref()
         return guild_user_prefs[user_id]
 
-    async def _send_map_style_preview_batches(
+    async def _send_embed_file_batches(
         self,
         ctx: commands.Context,
         embeds: list[discord.Embed],
         files: list[discord.File],
+        first_content: str | None = None,
         batch_size: int = 3,
     ):
-        """Send map style previews in smaller batches so Discord reliably renders each image."""
+        """Send embeds with files in smaller batches so Discord reliably renders each image."""
         for batch_start in range(0, len(embeds), batch_size):
-            content = "Map style previews:" if batch_start == 0 else None
             await ctx.send(
-                content=content,
+                content=first_content if batch_start == 0 else None,
                 embeds=embeds[batch_start:batch_start + batch_size],
                 files=files[batch_start:batch_start + batch_size],
             )
@@ -575,6 +579,178 @@ class LiveTracking(commands.Cog):
         await ctx.send(embed=embed, file=img_file)
 
 
+    @commands.hybrid_command(name="overview")
+    async def overview(self, ctx: commands.Context, days: int = 30):
+        """Send a multi-chart overview of recent earthquake activity."""
+        if ctx.interaction is not None:
+            await ctx.defer()
+
+        if days < 1 or days > 3650:
+            await ctx.send("Please choose a window between 1 and 3650 days.")
+            return
+
+        df = load_eq_db_to_df()
+        if df.empty:
+            await ctx.send("No earthquake data is available yet.")
+            return
+
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df["magnitude"] = pd.to_numeric(df["magnitude"], errors="coerce")
+        df["tsunami_potential"] = df["tsunami_potential"].fillna(False).astype(bool)
+        df = df.dropna(subset=["time"]).copy()
+
+        if df.empty:
+            await ctx.send("Earthquake data is stored, but none of it has a usable timestamp yet.")
+            return
+
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+        df_window = df[df["time"] >= cutoff].copy()
+        using_all_data = False
+
+        if df_window.empty:
+            df_window = df.copy()
+            using_all_data = True
+
+        plot_style = 0
+        if ctx.guild is not None:
+            self._ensure_guild_pref(str(ctx.guild.id))
+            plot_style = self.guild_prefs[str(ctx.guild.id)]["PlotStyle"]
+
+        if using_all_data:
+            window_label = "All Recorded Data"
+        elif days == 1:
+            window_label = "Last 24 Hours"
+        else:
+            window_label = f"Last {days} Days"
+
+        start_time = df_window["time"].min()
+        end_time = df_window["time"].max()
+        if start_time.date() == end_time.date():
+            date_range_label = start_time.strftime("%b %d, %Y")
+        else:
+            date_range_label = (
+                f"{start_time.strftime('%b %d, %Y')} to {end_time.strftime('%b %d, %Y')}"
+            )
+
+        magnitude_values = df_window["magnitude"].dropna()
+        avg_mag = magnitude_values.mean() if not magnitude_values.empty else None
+        strongest_text = "N/A"
+        if not magnitude_values.empty:
+            strongest_row = df_window.loc[df_window["magnitude"].idxmax()]
+            strongest_text = (
+                f"M{strongest_row['magnitude']:.2f} - {strongest_row['place']}"
+            )
+
+        magnitude_45_count = int((df_window["magnitude"].fillna(-1) >= 4.5).sum())
+        tsunami_count = int(df_window["tsunami_potential"].sum())
+
+        guild_fragment = str(ctx.guild.id) if ctx.guild is not None else "dm"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"overview_{guild_fragment}_{timestamp}"
+        chart_specs = [
+            {
+                "suffix": "map",
+                "title": f"Earthquake Overview: {window_label}",
+                "description": (
+                    "Epicenters across the selected window. Marker size and color both track magnitude."
+                ),
+                "color": discord.Color.gold(),
+                "plotter": lambda path: plot_earthquake_overview_map(
+                    df_window,
+                    filename=path,
+                    plot_style=plot_style,
+                ),
+            },
+            {
+                "suffix": "activity",
+                "title": "Daily Activity",
+                "description": (
+                    "Bars show daily earthquake counts. Lines show the strongest and average day-level magnitudes."
+                ),
+                "color": discord.Color.blurple(),
+                "plotter": lambda path: plot_earthquake_activity_timeline(df_window, filename=path),
+            },
+            {
+                "suffix": "magnitude",
+                "title": "Magnitude Distribution",
+                "description": (
+                    "A histogram of event magnitudes, with average and median reference lines."
+                ),
+                "color": discord.Color.green(),
+                "plotter": lambda path: plot_earthquake_magnitude_distribution(
+                    df_window,
+                    filename=path,
+                ),
+            },
+            {
+                "suffix": "regions",
+                "title": "Most Active Regions",
+                "description": (
+                    "Top inferred countries, states, or regions by event count. Color shows average magnitude."
+                ),
+                "color": discord.Color.red(),
+                "plotter": lambda path: plot_earthquake_top_regions(df_window, filename=path),
+            },
+        ]
+
+        embeds: list[discord.Embed] = []
+        files: list[discord.File] = []
+        image_paths: list[str] = []
+
+        try:
+            for spec in chart_specs:
+                image_path = f"{base_name}_{spec['suffix']}.png"
+                attachment_name = os.path.basename(image_path)
+                image_paths.append(image_path)
+                spec["plotter"](image_path)
+
+                embed = discord.Embed(
+                    title=spec["title"],
+                    description=spec["description"],
+                    color=spec["color"],
+                )
+                embed.set_image(url=f"attachment://{attachment_name}")
+
+                if spec["suffix"] == "map":
+                    embed.add_field(name="Date Range", value=date_range_label, inline=False)
+                    embed.add_field(name="Total Quakes", value=f"{len(df_window):,}", inline=True)
+                    embed.add_field(
+                        name="Average Magnitude",
+                        value=f"{avg_mag:.2f}" if avg_mag is not None else "N/A",
+                        inline=True,
+                    )
+                    embed.add_field(name="M4.5+", value=f"{magnitude_45_count:,}", inline=True)
+                    embed.add_field(name="Strongest Event", value=strongest_text, inline=False)
+                    embed.add_field(
+                        name="Tsunami Flags",
+                        value=f"{tsunami_count:,}",
+                        inline=True,
+                    )
+
+                if using_all_data:
+                    embed.set_footer(
+                        text=f"No earthquakes were found in the requested last {days} day window, so all stored data is shown."
+                    )
+
+                files.append(discord.File(image_path, filename=attachment_name))
+                embeds.append(embed)
+
+            content = f"Earthquake overview for **{window_label}**."
+            await self._send_embed_file_batches(
+                ctx,
+                embeds,
+                files,
+                first_content=content,
+                batch_size=2,
+            )
+        except Exception as err:
+            await ctx.send(f"Unable to generate overview charts: {err}")
+        finally:
+            for path in image_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+
+
     @commands.hybrid_command(name="export-earthquakes", aliases=["exporteqcsv", "exportcsv"])
     async def export_earthquakes(self, ctx: commands.Context):
         """Export all earthquake records to CSV and upload files to the current channel."""
@@ -881,7 +1057,12 @@ class LiveTracking(commands.Cog):
         )
 
         try:
-            await self._send_map_style_preview_batches(ctx, embeds, files)
+            await self._send_embed_file_batches(
+                ctx,
+                embeds,
+                files,
+                first_content="Map style previews:",
+            )
             msg = await ctx.send(content=prompt)
         finally:
             for path in preview_paths:

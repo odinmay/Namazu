@@ -14,6 +14,7 @@ from colorlog.escape_codes import escape_codes as c
 import discord
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 try:
     import pycountry
@@ -969,8 +970,10 @@ def load_eq_db_to_df():
     earthquake_id_col = [row["earthquake_id"] for row in eq_db.values()]
     pager_alert_level_col = [row["pager_alert_level"] for row in eq_db.values()]
     tsunami_potential_col = [row["tsunami_potential"] for row in eq_db.values()]
+    depth_col = [row.get("depth") for row in eq_db.values()]
     latitude_col = [row["latitude"] for row in eq_db.values()]
     longitude_col = [row["longitude"] for row in eq_db.values()]
+    significance_col = [row.get("significance") for row in eq_db.values()]
 
     df_ready_dict = {"earthquake_id": earthquake_id_col,
                      "place": places_col,
@@ -979,13 +982,399 @@ def load_eq_db_to_df():
                      "time": time_col,
                      "pager_alert_level": pager_alert_level_col,
                      "tsunami_potential": tsunami_potential_col,
+                     "depth": depth_col,
                      "latitude": latitude_col,
                      "longitude": longitude_col,
+                     "significance": significance_col,
                      }
     df = pd.DataFrame.from_dict(df_ready_dict)
     end_time = time.perf_counter()
     logging.info("||=*=|| DataFrame Ready in %.2f seconds. ||=*=||", end_time - start_time)
     return df
+
+
+def _earthquake_region_label(place: str):
+    place_text = " ".join(str(place or "").split())
+    if not place_text:
+        return "Unknown"
+
+    state_codes = sorted(infer_us_state_codes_from_place(place_text))
+    if state_codes:
+        return US_STATE_ABBREV_TO_NAME[state_codes[0]]
+
+    country_names = sorted(infer_country_names_from_place(place_text, set(state_codes)))
+    if country_names:
+        return country_names[0]
+
+    if "," in place_text:
+        trailing_segment = place_text.split(",")[-1].strip()
+        if trailing_segment:
+            return trailing_segment.title() if trailing_segment.isupper() else trailing_segment
+
+    shortened = textwrap.shorten(place_text, width=32, placeholder="...")
+    return shortened.title() if shortened.isupper() else shortened
+
+
+def _prepare_earthquake_visual_df(eq_df: pd.DataFrame):
+    df = eq_df.copy()
+    expected_columns = (
+        "earthquake_id",
+        "place",
+        "magnitude",
+        "time",
+        "depth",
+        "latitude",
+        "longitude",
+        "significance",
+    )
+
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = pd.NA
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df["magnitude"] = pd.to_numeric(df["magnitude"], errors="coerce")
+    df["depth_km"] = pd.to_numeric(df["depth"], errors="coerce")
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df["significance"] = pd.to_numeric(df["significance"], errors="coerce")
+    df["date"] = df["time"].dt.date
+    df["region_label"] = df["place"].apply(_earthquake_region_label)
+    return df
+
+
+def _write_placeholder_chart(filename: str, title: str, message: str):
+    fig = go.Figure()
+    fig.add_annotation(
+        x=0.5,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        text=message,
+        showarrow=False,
+        font={"size": 18, "color": "#475569"},
+    )
+    fig.update_layout(
+        title={"text": title, "x": 0.5, "xanchor": "center"},
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="#f8fafc",
+        margin={"l": 40, "r": 40, "t": 70, "b": 40},
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+    )
+    fig.write_image(filename, width=1000, height=550)
+
+
+def _apply_overview_layout(
+    fig: go.Figure,
+    title: str,
+    *,
+    xaxis_title: str | None = None,
+    yaxis_title: str | None = None,
+):
+    fig.update_layout(
+        title={"text": title, "x": 0.5, "xanchor": "center"},
+        template="plotly_white",
+        paper_bgcolor="white",
+        plot_bgcolor="#f8fafc",
+        font={"color": "#0f172a"},
+        margin={"l": 60, "r": 40, "t": 70, "b": 60},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+        },
+    )
+    fig.update_xaxes(
+        title_text=xaxis_title,
+        gridcolor="#e2e8f0",
+        linecolor="#cbd5e1",
+        showline=True,
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title_text=yaxis_title,
+        gridcolor="#e2e8f0",
+        linecolor="#cbd5e1",
+        showline=True,
+        zeroline=False,
+    )
+
+
+def plot_earthquake_overview_map(
+    eq_df: pd.DataFrame,
+    filename="eq_overview_map.png",
+    plot_style=0,
+):
+    """Plot a magnitude-weighted map view for an overview card."""
+    style, _ = get_map_style_option(plot_style)
+    df = _prepare_earthquake_visual_df(eq_df)
+    map_df = df.dropna(subset=["latitude", "longitude"]).copy()
+
+    if map_df.empty:
+        _write_placeholder_chart(filename, "Earthquake Map", "No coordinate data is available yet.")
+        return
+
+    map_df["display_magnitude"] = map_df["magnitude"].fillna(0.0)
+    map_df["marker_size"] = map_df["display_magnitude"].clip(lower=0).mul(4).add(8)
+    map_df["magnitude_label"] = map_df["magnitude"].apply(
+        lambda value: f"{value:.1f}" if pd.notna(value) else "N/A"
+    )
+    map_df["time_label"] = map_df["time"].dt.strftime("%b %d, %Y %I:%M %p").fillna("Unknown time")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattermap(
+            lon=map_df["longitude"],
+            lat=map_df["latitude"],
+            mode="markers",
+            customdata=map_df[["place", "magnitude_label", "time_label"]].to_numpy(),
+            marker={
+                "size": map_df["marker_size"],
+                "color": map_df["display_magnitude"],
+                "colorscale": "Turbo",
+                "showscale": True,
+                "colorbar": {"title": "Magnitude"},
+                "opacity": 0.85,
+            },
+            hovertemplate=(
+                "%{customdata[0]}<br>"
+                "Magnitude %{customdata[1]}<br>"
+                "%{customdata[2]}<extra></extra>"
+            ),
+        )
+    )
+
+    map_config = {
+        "style": style["map_style"],
+        "center": {
+            "lon": float(map_df["longitude"].mean()),
+            "lat": float(map_df["latitude"].mean()),
+        },
+        "zoom": 3.2 if len(map_df) == 1 else 0.7,
+    }
+    if style.get("map_layers"):
+        map_config["layers"] = style["map_layers"]
+
+    fig.update_layout(
+        title={"text": "Earthquake Map", "x": 0.5, "xanchor": "center"},
+        font={"color": style["font_color"]},
+        margin={"r": 0, "t": 60, "l": 0, "b": 0},
+        map=map_config,
+        paper_bgcolor=style["paper_bgcolor"],
+        plot_bgcolor=style["paper_bgcolor"],
+        showlegend=False,
+    )
+    fig.write_image(filename, width=1000, height=550)
+
+
+def plot_earthquake_activity_timeline(eq_df: pd.DataFrame, filename="eq_activity_timeline.png"):
+    """Plot daily earthquake counts with recent magnitude trends."""
+    df = _prepare_earthquake_visual_df(eq_df)
+    timeline_df = df.dropna(subset=["time"]).copy()
+
+    if timeline_df.empty:
+        _write_placeholder_chart(
+            filename,
+            "Daily Activity",
+            "No timestamped earthquakes are available for this window.",
+        )
+        return
+
+    daily = (
+        timeline_df.groupby("date", dropna=True)
+        .agg(
+            quake_count=("earthquake_id", "count"),
+            avg_magnitude=("magnitude", "mean"),
+            max_magnitude=("magnitude", "max"),
+        )
+        .reset_index()
+    )
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=daily["date"],
+            y=daily["quake_count"],
+            name="Quakes",
+            marker_color="#2563eb",
+            hovertemplate="%{x|%b %d, %Y}<br>%{y} quakes<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=daily["date"],
+            y=daily["max_magnitude"],
+            name="Max Mag",
+            mode="lines+markers",
+            line={"color": "#f97316", "width": 3},
+            hovertemplate="%{x|%b %d, %Y}<br>Max magnitude %{y:.1f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    if daily["avg_magnitude"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=daily["date"],
+                y=daily["avg_magnitude"],
+                name="Avg Mag",
+                mode="lines",
+                line={"color": "#0f766e", "dash": "dot", "width": 2},
+                hovertemplate="%{x|%b %d, %Y}<br>Average magnitude %{y:.2f}<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+    _apply_overview_layout(fig, "Daily Activity", xaxis_title="Date", yaxis_title="Quake Count")
+    fig.update_xaxes(tickformat="%b %d")
+    fig.update_yaxes(rangemode="tozero", secondary_y=False, title_text="Quake Count")
+    fig.update_yaxes(rangemode="tozero", secondary_y=True, title_text="Magnitude")
+    fig.write_image(filename, width=1000, height=550)
+
+
+def plot_earthquake_magnitude_distribution(
+    eq_df: pd.DataFrame,
+    filename="eq_magnitude_distribution.png",
+):
+    """Plot a histogram of magnitudes for the selected earthquake window."""
+    df = _prepare_earthquake_visual_df(eq_df)
+    magnitudes = df["magnitude"].dropna()
+
+    if magnitudes.empty:
+        _write_placeholder_chart(
+            filename,
+            "Magnitude Distribution",
+            "No magnitude values are available for this window.",
+        )
+        return
+
+    magnitude_span = float(magnitudes.max() - magnitudes.min()) if len(magnitudes) > 1 else 0.0
+    if magnitude_span <= 2:
+        bin_size = 0.25
+    elif magnitude_span <= 5:
+        bin_size = 0.5
+    else:
+        bin_size = 1.0
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=magnitudes,
+            xbins={"size": bin_size},
+            marker_color="#10b981",
+            marker_line={"color": "#047857", "width": 1},
+            hovertemplate="Magnitude %{x}<br>%{y} quakes<extra></extra>",
+        )
+    )
+
+    avg_magnitude = float(magnitudes.mean())
+    median_magnitude = float(magnitudes.median())
+    fig.add_vline(x=avg_magnitude, line_width=3, line_dash="dash", line_color="#1d4ed8")
+    fig.add_vline(x=median_magnitude, line_width=3, line_dash="dot", line_color="#f97316")
+    fig.add_annotation(
+        x=avg_magnitude,
+        y=1.03,
+        yref="paper",
+        text=f"Avg {avg_magnitude:.2f}",
+        showarrow=False,
+        font={"color": "#1d4ed8"},
+    )
+    fig.add_annotation(
+        x=median_magnitude,
+        y=0.95,
+        yref="paper",
+        text=f"Median {median_magnitude:.2f}",
+        showarrow=False,
+        font={"color": "#f97316"},
+    )
+
+    _apply_overview_layout(
+        fig,
+        "Magnitude Distribution",
+        xaxis_title="Magnitude",
+        yaxis_title="Earthquake Count",
+    )
+    fig.update_layout(bargap=0.06, showlegend=False)
+    fig.update_yaxes(rangemode="tozero")
+    fig.write_image(filename, width=1000, height=550)
+
+
+def plot_earthquake_top_regions(eq_df: pd.DataFrame, filename="eq_top_regions.png"):
+    """Plot the most active inferred regions for the selected earthquake window."""
+    df = _prepare_earthquake_visual_df(eq_df)
+
+    regions = (
+        df.groupby("region_label", dropna=True)
+        .agg(
+            quake_count=("earthquake_id", "count"),
+            avg_magnitude=("magnitude", "mean"),
+            max_magnitude=("magnitude", "max"),
+        )
+        .reset_index()
+    )
+
+    if regions.empty:
+        _write_placeholder_chart(
+            filename,
+            "Most Active Regions",
+            "No region labels are available for this window.",
+        )
+        return
+
+    regions.sort_values(
+        by=["quake_count", "max_magnitude", "avg_magnitude", "region_label"],
+        ascending=[False, False, False, True],
+        inplace=True,
+    )
+    regions = regions.head(10).copy()
+    regions.sort_values(by=["quake_count", "avg_magnitude"], ascending=[True, True], inplace=True)
+    regions["avg_mag_label"] = regions["avg_magnitude"].apply(
+        lambda value: f"{value:.2f}" if pd.notna(value) else "N/A"
+    )
+    regions["max_mag_label"] = regions["max_magnitude"].apply(
+        lambda value: f"{value:.2f}" if pd.notna(value) else "N/A"
+    )
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=regions["quake_count"],
+            y=regions["region_label"],
+            orientation="h",
+            customdata=regions[["avg_mag_label", "max_mag_label"]].to_numpy(),
+            marker={
+                "color": regions["avg_magnitude"].fillna(0),
+                "colorscale": [
+                    [0.0, "#fde68a"],
+                    [0.5, "#fb923c"],
+                    [1.0, "#b91c1c"],
+                ],
+                "showscale": True,
+                "colorbar": {"title": "Avg Mag"},
+            },
+            hovertemplate=(
+                "%{y}<br>"
+                "%{x} quakes<br>"
+                "Avg magnitude %{customdata[0]}<br>"
+                "Max magnitude %{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+
+    _apply_overview_layout(
+        fig,
+        "Most Active Regions",
+        xaxis_title="Earthquake Count",
+        yaxis_title=None,
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=regions["region_label"].tolist())
+    fig.update_xaxes(rangemode="tozero")
+    fig.write_image(filename, width=1000, height=550)
 
 
 def _build_single_quake_title(mag, place: str):
